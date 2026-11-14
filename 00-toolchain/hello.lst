@@ -1,0 +1,52 @@
+     1                                  ; ============================================================
+     2                                  ; 第 00 章：NASM 源码骨架与第一个裸 PE
+     3                                  ;
+     4                                  ; 构建（在本目录下执行）：
+     5                                  ;   nasm -f win64 -l hello.lst -o hello.obj hello.asm
+     6                                  ;   ld -o hello.exe hello.obj -L "C:/msys64/ucrt64/lib" -lkernel32 --subsystem console --entry=_start
+     7                                  ;
+     8                                  ; 运行后退出码应为 42：
+     9                                  ;   .\hello.exe
+    10                                  ;   $LASTEXITCODE
+    11                                  ; ============================================================
+    12                                  
+    13                                  ; 默认使用 RIP 相对寻址：x64 中写 [magic] 比 [rel magic] 更安全，
+    14                                  ; 避免链接器生成 32 位绝对地址重定位。
+    15                                  default rel
+    16                                  
+    17                                  section .data
+    18                                      ; 已初始化的数据段：8 字节常量
+    19 00000000 8877665544332211            magic dq 0x1122334455667788
+    20                                  
+    21                                  section .bss
+    22                                      ; 未初始化的数据段：1 个 8 字节槽位，加载时清零
+    23 00000000 ????????????????            slot resq 1
+    24                                  
+    25                                  section .text
+    26                                      ; 把 _start 导出为链接器可见的入口符号
+    27                                      global _start
+    28                                  
+    29                                      ; 从 kernel32.dll 导入 ExitProcess（函数跳板由 libkernel32.a 提供）
+    30                                      extern ExitProcess
+    31                                  
+    32                                  _start:
+    33                                      ; Windows x64 进程入口：RSP % 16 == 8，栈顶是系统返回地址。
+    34                                      ; 调用外部函数前，先留出：
+    35                                      ;   8 字节  —— 把入口的 8 对齐到 16
+    36                                      ;   32 字节 —— Windows x64 的影子空间
+    37                                      ; 合计 40 字节。
+    38 00000000 4883EC28                    sub rsp, 40
+    39                                  
+    40                                      ; 演示 .data -> 寄存器 -> .bss 的读写
+    41 00000004 488B05(00000000)            mov rax, [rel magic]        ; 从 .data 读 8 字节
+    42 0000000B 488905(00000000)            mov [rel slot], rax         ; 写入 .bss
+    43                                  
+    44                                      ; ExitProcess(UINT uExitCode)
+    45                                      ; 第 1 个参数走 ECX；写 ECX 会自动把 RCX 高 32 位清零。
+    46 00000012 B92A000000                  mov ecx, 42
+    47 00000017 E8(00000000)                call ExitProcess            ; 不返回
+    48                                  
+    49                                      ; ExitProcess 正常不会返回；这里只是防御性收尾。
+    50 0000001C 4883C428                    add rsp, 40
+    51 00000020 31C0                        xor eax, eax
+    52 00000022 C3                          ret

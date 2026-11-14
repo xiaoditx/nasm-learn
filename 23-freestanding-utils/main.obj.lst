@@ -1,0 +1,424 @@
+     1                                  ; ============================================================
+     2                                  ; 第 23 章：无 CRT 工具库（main 模块）
+     3                                  ; 演示：打印字符串、u64 转十进制、wcslen、堆分配
+     4                                  ; 构建：make    产物：freestanding.exe（console 子系统）
+     5                                  ; 运行：.\freestanding.exe    —— 管道重定向下也能看到输出！
+     6                                  ; ============================================================
+     7                                  %include "../common.asm"
+     1                              <1> ; ============================================================
+     2                              <1> ; common.asm —— 全项目共享定义
+     3                              <1> ; 只包含预处理指令、常量与宏，不产生任何段/数据。
+     4                              <1> ; 用法：在章节目录中写  %include "../common.asm"
+     5                              <1> ; ============================================================
+     6                              <1> 
+     7                              <1> ; ---------- Windows x64 栈约定 ----------
+     8                              <1> %define SHADOW_SPACE          32      ; 调用前必须预留的影子空间
+     9                              <1> %define ENTRY_SUB_RSP         40      ; 入口 RSP%16==8 → 减 40 后 %16==0
+    10                              <1> %define FRAME_SUB_RSP         32      ; push rbp 之后 %16==0 → 再减 32
+    11                              <1> 
+    12                              <1> ; ---------- 通用常量 ----------
+    13                              <1> %define NULL                  0
+    14                              <1> %define TRUE                  1
+    15                              <1> %define FALSE                 0
+    16                              <1> %define WCHAR_SIZE            2       ; UTF-16 码元大小
+    17                              <1> %define MAX_PATH_W            260
+    18                              <1> 
+    19                              <1> ; ---------- 标准设备 ----------
+    20                              <1> %define STD_OUTPUT_HANDLE     -11
+    21                              <1> %define STD_ERROR_HANDLE      -12
+    22                              <1> 
+    23                              <1> ; ---------- 文件 ----------
+    24                              <1> %define INVALID_HANDLE_VALUE  -1
+    25                              <1> %define GENERIC_READ          0x80000000
+    26                              <1> %define GENERIC_WRITE         0x40000000
+    27                              <1> %define CREATE_ALWAYS         2
+    28                              <1> %define OPEN_EXISTING         3
+    29                              <1> %define FILE_ATTRIBUTE_NORMAL 0x80
+    30                              <1> 
+    31                              <1> ; ---------- 错误码 ----------
+    32                              <1> %define ERROR_FILE_NOT_FOUND  2
+    33                              <1> %define ERROR_PATH_NOT_FOUND  3
+    34                              <1> %define ERROR_ACCESS_DENIED   5
+    35                              <1> 
+    36                              <1> ; ---------- 代码页 ----------
+    37                              <1> %define CP_UTF8               65001
+    38                              <1> 
+    39                              <1> ; ---------- 堆 ----------
+    40                              <1> %define HEAP_ZERO_MEMORY      8
+    41                              <1> 
+    42                              <1> ; ---------- 宽字符串宏（UTF-16LE） ----------
+    43                              <1> ; WSTR  ：展开为 UTF-16LE 码元，不带结尾 0
+    44                              <1> ; WSTRZ ：展开为 UTF-16LE 码元，并追加一个 0 结尾
+    45                              <1> %macro WSTR 1
+    46                              <1>     dw __utf16__(%1)
+    47                              <1> %endmacro
+    48                              <1> 
+    49                              <1> %macro WSTRZ 1
+    50                              <1>     dw __utf16__(%1), 0
+    51                              <1> %endmacro
+    52                              <1> 
+    53                              <1> ; ---------- COM 方法调用（第 16 章起） ----------
+    54                              <1> ; 用法：COM_CALL <持有接口指针的寄存器>, <虚表槽位>
+    55                              <1> ; 只破坏 RAX；调用参数必须在宏展开前放进 RCX/RDX/R8/R9 和栈。
+    56                              <1> ; 例：mov rcx, [rel p_rt]  →  rcx = this
+    57                              <1> ;     lea rdx, [rel color]
+    58                              <1> ;     COM_CALL rcx, 47        ; ID2D1RenderTarget::Clear
+    59                              <1> %macro COM_CALL 2
+    60                              <1>     mov  rax, [%1]
+    61                              <1>     call qword [rax + (%2) * 8]
+    62                              <1> %endmacro
+    63                              <1> 
+    64                              <1> ; ---------- 第 12 章：文本统计结构（多个 .asm 共用） ----------
+    65                              <1> struc TEXT_STATS
+    66 00000000 ????????            <1>     .chars: resd 1
+    67 00000004 ????????            <1>     .lines: resd 1
+    68 00000008 ????????            <1>     .words: resd 1
+    69                              <1> endstruc
+    70                              <1> 
+    71                              <1> ; ============================================================
+    72                              <1> ; 第 13 章起：Win32 窗口与消息
+    73                              <1> ; 常量值全部来自 MinGW 头文件（winuser.h / winbase.h）
+    74                              <1> ; ============================================================
+    75                              <1> 
+    76                              <1> %define WS_OVERLAPPEDWINDOW   0x00CF0000
+    77                              <1> %define WS_VISIBLE           0x10000000
+    78                              <1> %define CW_USEDEFAULT        0x80000000
+    79                              <1> %define CS_VREDRAW           0x0001
+    80                              <1> %define CS_HREDRAW           0x0002
+    81                              <1> %define SW_SHOWNORMAL        1
+    82                              <1> %define SW_SHOW              5
+    83                              <1> %define IDC_ARROW            32512
+    84                              <1> %define IDI_APPLICATION      32512
+    85                              <1> %define COLOR_WINDOW         5
+    86                              <1> %define COLOR_WINDOWTEXT     8
+    87                              <1> 
+    88                              <1> %define WM_CREATE            0x0001
+    89                              <1> %define WM_DESTROY           0x0002
+    90                              <1> %define WM_SIZE              0x0005
+    91                              <1> %define WM_ACTIVATE          0x0006
+    92                              <1> %define WM_PAINT             0x000F
+    93                              <1> %define WM_CLOSE             0x0010
+    94                              <1> %define WM_ERASEBKGND        0x0014
+    95                              <1> %define WM_KEYDOWN           0x0100
+    96                              <1> %define WM_CHAR              0x0102
+    97                              <1> %define WM_TIMER             0x0113
+    98                              <1> %define WM_LBUTTONDOWN       0x0201
+    99                              <1> 
+   100                              <1> %define VK_ESCAPE            0x1B
+   101                              <1> %define VK_SPACE             0x20
+   102                              <1> %define PM_REMOVE            0x0001
+   103                              <1> 
+   104                              <1> %define TRANSPARENT          1
+   105                              <1> %define DT_LEFT              0
+   106                              <1> %define DT_TOP               0
+   107                              <1> %define DT_CENTER            0x0001
+   108                              <1> %define DT_SINGLELINE        0x0020
+   109                              <1> 
+   110                              <1> ; WNDCLASSEXW：winuser.h:897-910。x64 下 sizeof == 80。
+   111                              <1> ; 注意 cbClsExtra(16) 与 cbWndExtra(20) 之间没有填充，
+   112                              <1> ; 但 hInstance 位于 24，正好是 8 字节对齐，所以这里不需要手工补位。
+   113                              <1> struc WNDCLASSEXW
+   114 00000000 ????????            <1>     .cbSize:        resd 1      ; +0
+   115 00000004 ????????            <1>     .style:         resd 1      ; +4
+   116 00000008 ????????????????    <1>     .lpfnWndProc:   resq 1      ; +8
+   117 00000010 ????????            <1>     .cbClsExtra:    resd 1      ; +16
+   118 00000014 ????????            <1>     .cbWndExtra:    resd 1      ; +20
+   119 00000018 ????????????????    <1>     .hInstance:     resq 1      ; +24
+   120 00000020 ????????????????    <1>     .hIcon:         resq 1      ; +32
+   121 00000028 ????????????????    <1>     .hCursor:       resq 1      ; +40
+   122 00000030 ????????????????    <1>     .hbrBackground: resq 1      ; +48
+   123 00000038 ????????????????    <1>     .lpszMenuName:  resq 1      ; +56
+   124 00000040 ????????????????    <1>     .lpszClassName: resq 1      ; +64
+   125 00000048 ????????????????    <1>     .hIconSm:       resq 1      ; +72
+   126                              <1> endstruc                        ; = 80
+   127                              <1> 
+   128                              <1> ; MSG：winuser.h:955-961。x64 下 sizeof == 48。
+   129                              <1> ; message 之后有 4 字节隐式填充（wParam 必须 8 对齐），
+   130                              <1> ; 末尾 pt 之后还有 4 字节尾部填充。NASM 的 struc 不会自动补，
+   131                              <1> ; 所以显式写 .pad0 / .pad1。
+   132                              <1> struc MSG
+   133 00000000 ????????????????    <1>     .hwnd:      resq 1          ; +0
+   134 00000008 ????????            <1>     .message:   resd 1          ; +8
+   135 0000000C ????????            <1>     .pad0:      resd 1          ; +12  隐式填充
+   136 00000010 ????????????????    <1>     .wParam:    resq 1          ; +16
+   137 00000018 ????????????????    <1>     .lParam:    resq 1          ; +24
+   138 00000020 ????????            <1>     .time:      resd 1          ; +32
+   139 00000024 ????????            <1>     .pt_x:      resd 1          ; +36
+   140 00000028 ????????            <1>     .pt_y:      resd 1          ; +40
+   141 0000002C ????????            <1>     .pad1:      resd 1          ; +44  尾部填充
+   142                              <1> endstruc                        ; = 48
+   143                              <1> 
+   144                              <1> ; PAINTSTRUCT：winuser.h:1823-1830。x64 下 sizeof == 72。
+   145                              <1> struc PAINTSTRUCT
+   146 00000000 ????????????????    <1>     .hdc:           resq 1      ; +0
+   147 00000008 ????????            <1>     .fErase:        resd 1      ; +8
+   148 0000000C ????????            <1>     .rcPaint_left:  resd 1      ; +12
+   149 00000010 ????????            <1>     .rcPaint_top:   resd 1      ; +16
+   150 00000014 ????????            <1>     .rcPaint_right: resd 1      ; +20
+   151 00000018 ????????            <1>     .rcPaint_bottom:resd 1      ; +24
+   152 0000001C ????????            <1>     .fRestore:      resd 1      ; +28
+   153 00000020 ????????            <1>     .fIncUpdate:    resd 1      ; +32
+   154 00000024 <res 20h>           <1>     .rgbReserved:   resb 32     ; +36
+   155 00000044 ????????            <1>     .pad:           resb 4      ; +68  补齐到 8 的倍数
+   156                              <1> endstruc                        ; = 72
+   157                              <1> 
+   158                              <1> ; RECT：windef.h，4 个 LONG，共 16 字节
+   159                              <1> struc RECT
+   160 00000000 ????????            <1>     .left:   resd 1
+   161 00000004 ????????            <1>     .top:    resd 1
+   162 00000008 ????????            <1>     .right:  resd 1
+   163 0000000C ????????            <1>     .bottom: resd 1
+   164                              <1> endstruc                        ; = 16
+   165                              <1> 
+   166                              <1> ; ============================================================
+   167                              <1> ; 第 17 章起：Direct2D 结构体
+   168                              <1> ; 布局来自 MinGW：d2d1.h / dcommon.h / d2dbasetypes.h
+   169                              <1> ; ============================================================
+   170                              <1> 
+   171                              <1> %define D2D1_FACTORY_TYPE_SINGLE_THREADED  0
+   172                              <1> %define D2D1_FACTORY_TYPE_MULTI_THREADED   1
+   173                              <1> 
+   174                              <1> %define D2D1_RENDER_TARGET_TYPE_DEFAULT    0
+   175                              <1> %define D2D1_RENDER_TARGET_TYPE_HARDWARE   1
+   176                              <1> %define D2D1_RENDER_TARGET_TYPE_SOFTWARE   2
+   177                              <1> 
+   178                              <1> %define D2D1_ALPHA_MODE_UNKNOWN            0
+   179                              <1> %define D2D1_ALPHA_MODE_PREMULTIPLIED      1
+   180                              <1> %define D2D1_ALPHA_MODE_STRAIGHT           2
+   181                              <1> %define D2D1_ALPHA_MODE_IGNORE             3
+   182                              <1> 
+   183                              <1> %define DXGI_FORMAT_UNKNOWN                 0
+   184                              <1> %define DXGI_FORMAT_B8G8R8A8_UNORM          87
+   185                              <1> 
+   186                              <1> %define D2D1_PRESENT_OPTIONS_NONE           0
+   187                              <1> %define D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS 1
+   188                              <1> %define D2D1_PRESENT_OPTIONS_IMMEDIATELY    2
+   189                              <1> 
+   190                              <1> %define D2D1_WINDOW_STATE_NONE              0
+   191                              <1> %define D2D1_WINDOW_STATE_OCCLUDED          1
+   192                              <1> %define D2D1_WINDOW_STATE_HIDDEN            2
+   193                              <1> 
+   194                              <1> ; 虚表槽位（d2d1.h 中 ID2D1RenderTargetVtbl / ID2D1HwndRenderTargetVtbl 的顺序）
+   195                              <1> %define D2D1_RT_CREATE_SOLID_COLOR_BRUSH    8
+   196                              <1> %define D2D1_RT_DRAW_RECTANGLE              16
+   197                              <1> %define D2D1_RT_FILL_RECTANGLE              17
+   198                              <1> %define D2D1_RT_FILL_ELLIPSE                21
+   199                              <1> %define D2D1_RT_CLEAR                       47
+   200                              <1> %define D2D1_RT_BEGIN_DRAW                  48
+   201                              <1> %define D2D1_RT_END_DRAW                    49
+   202                              <1> %define D2D1_HWND_RT_RESIZE                 58
+   203                              <1> %define D2D1_FACTORY_CREATE_HWND_RT         14
+   204                              <1> %define IUNKNOWN_QUERY_INTERFACE            0
+   205                              <1> %define IUNKNOWN_ADD_REF                    1
+   206                              <1> %define IUNKNOWN_RELEASE                    2
+   207                              <1> 
+   208                              <1> ; HRESULT 成功码的常用判断值
+   209                              <1> %define S_OK                                0
+   210                              <1> %define D2DERR_RECREATE_TARGET              0x8899000C
+   211                              <1> 
+   212                              <1> ; D2D1_PIXEL_FORMAT：dcommon.h:68-71，8 字节
+   213                              <1> struc D2D1_PIXEL_FORMAT
+   214 00000000 ????????            <1>     .format:    resd 1          ; DXGI_FORMAT
+   215 00000004 ????????            <1>     .alphaMode: resd 1          ; D2D1_ALPHA_MODE
+   216                              <1> endstruc                        ; = 8
+   217                              <1> 
+   218                              <1> ; D2D1_RENDER_TARGET_PROPERTIES：d2d1.h:453-460，28 字节
+   219                              <1> ; 全部填 0 就是“默认硬件渲染目标 + 未知像素格式”
+   220                              <1> struc D2D1_RENDER_TARGET_PROPERTIES
+   221 00000000 ????????            <1>     .type:                  resd 1   ; +0
+   222 00000004 ????????            <1>     .pixelFormat_format:    resd 1   ; +4
+   223 00000008 ????????            <1>     .pixelFormat_alphaMode: resd 1   ; +8
+   224 0000000C ????????            <1>     .dpiX:                  resd 1   ; +12
+   225 00000010 ????????            <1>     .dpiY:                  resd 1   ; +16
+   226 00000014 ????????            <1>     .usage:                 resd 1   ; +20
+   227 00000018 ????????            <1>     .minLevel:              resd 1   ; +24
+   228                              <1> endstruc                              ; = 28
+   229                              <1> 
+   230                              <1> ; D2D1_HWND_RENDER_TARGET_PROPERTIES：d2d1.h:420-424，24 字节
+   231                              <1> struc D2D1_HWND_RENDER_TARGET_PROPERTIES
+   232 00000000 ????????????????    <1>     .hwnd:           resq 1      ; +0
+   233 00000008 ????????            <1>     .pixelSize_width:  resd 1    ; +8
+   234 0000000C ????????            <1>     .pixelSize_height: resd 1    ; +12
+   235 00000010 ????????            <1>     .presentOptions: resd 1      ; +16
+   236 00000014 ????????            <1>     .pad:            resd 1      ; +20  尾部填充
+   237                              <1> endstruc                          ; = 24
+   238                              <1> 
+   239                              <1> ; D2D1_COLOR_F == D3DCOLORVALUE，4 个 FLOAT，16 字节
+   240                              <1> struc D2D1_COLOR_F
+   241 00000000 ????????            <1>     .r: resd 1
+   242 00000004 ????????            <1>     .g: resd 1
+   243 00000008 ????????            <1>     .b: resd 1
+   244 0000000C ????????            <1>     .a: resd 1
+   245                              <1> endstruc                        ; = 16
+   246                              <1> 
+   247                              <1> ; D2D1_RECT_F == D2D_RECT_F，4 个 FLOAT，16 字节
+   248                              <1> struc D2D1_RECT_F
+   249 00000000 ????????            <1>     .left:   resd 1
+   250 00000004 ????????            <1>     .top:    resd 1
+   251 00000008 ????????            <1>     .right:  resd 1
+   252 0000000C ????????            <1>     .bottom: resd 1
+   253                              <1> endstruc                        ; = 16
+   254                              <1> 
+   255                              <1> ; D2D1_SIZE_U，2 个 UINT32，8 字节
+   256                              <1> struc D2D1_SIZE_U
+   257 00000000 ????????            <1>     .width:  resd 1
+   258 00000004 ????????            <1>     .height: resd 1
+   259                              <1> endstruc                        ; = 8
+   260                              <1> 
+   261                              <1> ; D2D1_ELLIPSE：d2d1.h:405，point + radiusX + radiusY，16 字节
+   262                              <1> struc D2D1_ELLIPSE
+   263 00000000 ????????            <1>     .point_x: resd 1            ; +0
+   264 00000004 ????????            <1>     .point_y: resd 1            ; +4
+   265 00000008 ????????            <1>     .radiusX: resd 1            ; +8
+   266 0000000C ????????            <1>     .radiusY: resd 1            ; +12
+   267                              <1> endstruc                        ; = 16
+   268                              <1> 
+   269                              <1> ; D2D1_FACTORY_OPTIONS：d2d1.h:411-413，4 字节
+   270                              <1> struc D2D1_FACTORY_OPTIONS
+   271 00000000 ????????            <1>     .debugLevel: resd 1
+   272                              <1> endstruc                        ; = 4
+   273                              <1> 
+   274                              <1> ; D2D1_BRUSH_PROPERTIES：d2d1.h:392-395，28 字节
+   275                              <1> struc D2D1_BRUSH_PROPERTIES
+   276 00000000 ????????            <1>     .opacity: resd 1            ; +0
+   277 00000004 ????????            <1>     .m11: resd 1                ; +4
+   278 00000008 ????????            <1>     .m12: resd 1                ; +8
+   279 0000000C ????????            <1>     .m21: resd 1                ; +12
+   280 00000010 ????????            <1>     .m22: resd 1                ; +16
+   281 00000014 ????????            <1>     .m31: resd 1                ; +20
+   282 00000018 ????????            <1>     .m32: resd 1                ; +24
+   283                              <1> endstruc                        ; = 28
+     8                                  
+     9                                  default rel
+    10                                  
+    11                                  extern ExitProcess
+    12                                  
+    13                                  ; ---- 跨文件引用：utils.asm 里的全局符号 ----
+    14                                  extern util_wcslen
+    15                                  extern util_u64_to_wstr
+    16                                  extern util_print_wstr
+    17                                  extern util_alloc
+    18                                  extern util_free
+    19                                  
+    20                                  global _start
+    21                                  
+    22                                  section .data
+    23                                  str_hello:
+    24                                      WSTR "freestanding utils demo (no CRT)"
+    46 00000000 660072006500650073- <1>  dw __utf16__(%1)
+    46 00000009 00740061006E006400- <1>
+    46 00000012 69006E006700200075- <1>
+    46 0000001B 00740069006C007300- <1>
+    46 00000024 2000640065006D006F- <1>
+    46 0000002D 00200028006E006F00- <1>
+    46 00000036 200043005200540029- <1>
+    46 0000003F 00                  <1>
+    25 00000040 0D000A000000                dw 13, 10, 0
+    26                                  str_lbl_zero:  WSTRZ "u64 0        = "
+    26                              <1> str_lbl_zero: 
+    50 00000046 750036003400200030- <1>  dw __utf16__(%1), 0
+    50 0000004F 002000200020002000- <1>
+    50 00000058 20002000200020003D- <1>
+    50 00000061 0020000000          <1>
+    27                                  str_lbl_max:   WSTRZ "u64 max      = "
+    27                              <1> str_lbl_max: 
+    50 00000066 75003600340020006D- <1>  dw __utf16__(%1), 0
+    50 0000006F 006100780020002000- <1>
+    50 00000078 20002000200020003D- <1>
+    50 00000081 0020000000          <1>
+    28                                  str_lbl_len:   WSTRZ "wcslen(count)= "
+    28                              <1> str_lbl_len: 
+    50 00000086 7700630073006C0065- <1>  dw __utf16__(%1), 0
+    50 0000008F 006E00280063006F00- <1>
+    50 00000098 75006E00740029003D- <1>
+    50 000000A1 0020000000          <1>
+    29                                  str_lbl_heap:  WSTRZ "heap 2^40    = "
+    29                              <1> str_lbl_heap: 
+    50 000000A6 680065006100700020- <1>  dw __utf16__(%1), 0
+    50 000000AF 0032005E0034003000- <1>
+    50 000000B8 20002000200020003D- <1>
+    50 000000C1 0020000000          <1>
+    30                                  str_countme:   WSTRZ "0123456789"
+    30                              <1> str_countme: 
+    50 000000C6 300031003200330034- <1>  dw __utf16__(%1), 0
+    50 000000CF 003500360037003800- <1>
+    50 000000D8 39000000            <1>
+    31 000000DC 0D000A000000            str_crlf:      dw 13, 10, 0
+    32                                  
+    33                                  section .bss
+    34 00000000 <res 40h>               numbuf:     resw 32             ; 数字转换缓冲（21 个码元够用，给 32）
+    35                                  
+    36                                  section .text
+    37                                  
+    38                                  ; ------------------------------------------------------------
+    39                                  ; _start：RSP%16==8 → sub rsp,40 后 ==0
+    40                                  ; 只调用本模块外的 util_* 与 ExitProcess，最大栈参 0 → 40 字节帧足够
+    41                                  ; ------------------------------------------------------------
+    42                                  _start:
+    43 00000000 4883EC28                    sub     rsp, 40
+    44                                  
+    45                                      ; ---- 1. 直接打印字符串 ----
+    46 00000004 488D0D(00000000)            lea     rcx, [rel str_hello]
+    47 0000000B E8(00000000)                call    util_print_wstr
+    48                                  
+    49                                      ; ---- 2. u64 = 0（验证 do-while 能生成 '0'） ----
+    50 00000010 488D0D(46000000)            lea     rcx, [rel str_lbl_zero]
+    51 00000017 E8(00000000)                call    util_print_wstr
+    52 0000001C 31C9                        xor     ecx, ecx
+    53 0000001E 488D15(00000000)            lea     rdx, [rel numbuf]
+    54 00000025 E8(00000000)                call    util_u64_to_wstr
+    55 0000002A 488D0D(00000000)            lea     rcx, [rel numbuf]
+    56 00000031 E8(00000000)                call    util_print_wstr
+    57 00000036 488D0D(DC000000)            lea     rcx, [rel str_crlf]
+    58 0000003D E8(00000000)                call    util_print_wstr
+    59                                  
+    60                                      ; ---- 3. u64 最大值 18446744073709551615（20 位，压力测试） ----
+    61 00000042 488D0D(66000000)            lea     rcx, [rel str_lbl_max]
+    62 00000049 E8(00000000)                call    util_print_wstr
+    63 0000004E 48C7C1FFFFFFFF              mov     rcx, -1                     ; 0xFFFFFFFFFFFFFFFF
+    64 00000055 488D15(00000000)            lea     rdx, [rel numbuf]
+    65 0000005C E8(00000000)                call    util_u64_to_wstr
+    66 00000061 488D0D(00000000)            lea     rcx, [rel numbuf]
+    67 00000068 E8(00000000)                call    util_print_wstr
+    68 0000006D 488D0D(DC000000)            lea     rcx, [rel str_crlf]
+    69 00000074 E8(00000000)                call    util_print_wstr
+    70                                  
+    71                                      ; ---- 4. wcslen("0123456789") = 10，结果也走 u64→wstr 打印 ----
+    72 00000079 488D0D(86000000)            lea     rcx, [rel str_lbl_len]
+    73 00000080 E8(00000000)                call    util_print_wstr
+    74 00000085 488D0D(C6000000)            lea     rcx, [rel str_countme]
+    75 0000008C E8(00000000)                call    util_wcslen
+    76 00000091 4889C1                      mov     rcx, rax
+    77 00000094 488D15(00000000)            lea     rdx, [rel numbuf]
+    78 0000009B E8(00000000)                call    util_u64_to_wstr
+    79 000000A0 488D0D(00000000)            lea     rcx, [rel numbuf]
+    80 000000A7 E8(00000000)                call    util_print_wstr
+    81 000000AC 488D0D(DC000000)            lea     rcx, [rel str_crlf]
+    82 000000B3 E8(00000000)                call    util_print_wstr
+    83                                  
+    84                                      ; ---- 5. 堆演示：申请 64 字节，把 2^40 写进去再打印 ----
+    85 000000B8 B940000000                  mov     ecx, 64
+    86 000000BD E8(00000000)                call    util_alloc
+    87 000000C2 4885C0                      test    rax, rax
+    88 000000C5 743D                        jz      .no_heap
+    89 000000C7 4889C3                      mov     rbx, rax                    ; _start 无调用者，RBX 随便用
+    90                                  
+    91 000000CA 48B900000000000100-         mov     rcx, 0x10000000000          ; 2^40 = 1099511627776
+    91 000000D3 00                 
+    92 000000D4 4889DA                      mov     rdx, rbx
+    93 000000D7 E8(00000000)                call    util_u64_to_wstr
+    94                                  
+    95 000000DC 488D0D(A6000000)            lea     rcx, [rel str_lbl_heap]
+    96 000000E3 E8(00000000)                call    util_print_wstr
+    97 000000E8 4889D9                      mov     rcx, rbx
+    98 000000EB E8(00000000)                call    util_print_wstr
+    99 000000F0 488D0D(DC000000)            lea     rcx, [rel str_crlf]
+   100 000000F7 E8(00000000)                call    util_print_wstr
+   101                                  
+   102 000000FC 4889D9                      mov     rcx, rbx
+   103 000000FF E8(00000000)                call    util_free
+   104                                  .no_heap:
+   105                                  
+   106                                      ; ---- 退出码 0 ----
+   107 00000104 31C9                        xor     ecx, ecx
+   108 00000106 E8(00000000)                call    ExitProcess

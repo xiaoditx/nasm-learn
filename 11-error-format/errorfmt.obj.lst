@@ -1,0 +1,263 @@
+     1                                  ; ============================================================
+     2                                  ; 第 11 章：错误码与格式化 —— GetLastError + FormatMessageW
+     3                                  ; 演示：打开一个不存在的文件 → 取错误码 → 取系统错误文本 → UTF-8 输出
+     4                                  ; 运行：.\errorfmt.exe
+     5                                  ; 重点：FormatMessageW 有 7 个参数，后 3 个必须放在栈上。
+     6                                  ; ============================================================
+     7                                  default rel
+     8                                  %include "../common.asm"
+     1                              <1> ; ============================================================
+     2                              <1> ; common.asm —— 全项目共享定义
+     3                              <1> ; 只包含预处理指令、常量与宏，不产生任何段/数据。
+     4                              <1> ; 用法：在章节目录中写  %include "../common.asm"
+     5                              <1> ; ============================================================
+     6                              <1> 
+     7                              <1> ; ---------- Windows x64 栈约定 ----------
+     8                              <1> %define SHADOW_SPACE          32      ; 调用前必须预留的影子空间
+     9                              <1> %define ENTRY_SUB_RSP         40      ; 入口 RSP%16==8 → 减 40 后 %16==0
+    10                              <1> %define FRAME_SUB_RSP         32      ; push rbp 之后 %16==0 → 再减 32
+    11                              <1> 
+    12                              <1> ; ---------- 通用常量 ----------
+    13                              <1> %define NULL                  0
+    14                              <1> %define TRUE                  1
+    15                              <1> %define FALSE                 0
+    16                              <1> %define WCHAR_SIZE            2       ; UTF-16 码元大小
+    17                              <1> %define MAX_PATH_W            260
+    18                              <1> 
+    19                              <1> ; ---------- 标准设备 ----------
+    20                              <1> %define STD_OUTPUT_HANDLE     -11
+    21                              <1> %define STD_ERROR_HANDLE      -12
+    22                              <1> 
+    23                              <1> ; ---------- 文件 ----------
+    24                              <1> %define INVALID_HANDLE_VALUE  -1
+    25                              <1> %define GENERIC_READ          0x80000000
+    26                              <1> %define GENERIC_WRITE         0x40000000
+    27                              <1> %define CREATE_ALWAYS         2
+    28                              <1> %define OPEN_EXISTING         3
+    29                              <1> %define FILE_ATTRIBUTE_NORMAL 0x80
+    30                              <1> 
+    31                              <1> ; ---------- 错误码 ----------
+    32                              <1> %define ERROR_FILE_NOT_FOUND  2
+    33                              <1> %define ERROR_PATH_NOT_FOUND  3
+    34                              <1> %define ERROR_ACCESS_DENIED   5
+    35                              <1> 
+    36                              <1> ; ---------- 代码页 ----------
+    37                              <1> %define CP_UTF8               65001
+    38                              <1> 
+    39                              <1> ; ---------- 堆 ----------
+    40                              <1> %define HEAP_ZERO_MEMORY      8
+    41                              <1> 
+    42                              <1> ; ---------- 宽字符串宏（UTF-16LE） ----------
+    43                              <1> ; WSTR  ：展开为 UTF-16LE 码元，不带结尾 0
+    44                              <1> ; WSTRZ ：展开为 UTF-16LE 码元，并追加一个 0 结尾
+    45                              <1> %macro WSTR 1
+    46                              <1>     dw __utf16__(%1)
+    47                              <1> %endmacro
+    48                              <1> 
+    49                              <1> %macro WSTRZ 1
+    50                              <1>     dw __utf16__(%1), 0
+    51                              <1> %endmacro
+    52                              <1> 
+    53                              <1> ; ---------- 第 12 章：文本统计结构（多个 .asm 共用） ----------
+    54                              <1> struc TEXT_STATS
+    55 00000000 ????????            <1>     .chars: resd 1
+    56 00000004 ????????            <1>     .lines: resd 1
+    57 00000008 ????????            <1>     .words: resd 1
+    58                              <1> endstruc
+     9                                  
+    10                                  section .rdata
+    11                                      filename:   WSTRZ "no_such_file.txt"
+    11                              <1>  filename: 
+    50 00000000 6E006F005F00730075- <1>  dw __utf16__(%1), 0
+    50 00000009 00630068005F006600- <1>
+    50 00000012 69006C0065002E0074- <1>
+    50 0000001B 00780074000000      <1>
+    12                                  
+    13                                      fmt_handle: WSTR "CreateFileW returned %p"
+    13                              <1>  fmt_handle: 
+    46 00000022 430072006500610074- <1>  dw __utf16__(%1)
+    46 0000002B 006500460069006C00- <1>
+    46 00000034 650057002000720065- <1>
+    46 0000003D 007400750072006E00- <1>
+    46 00000046 650064002000250070- <1>
+    46 0000004F 00                  <1>
+    14 00000050 0A000000                                dw 10, 0
+    15                                      fmt_err:    WSTR "GetLastError() = %lu"
+    15                              <1>  fmt_err: 
+    46 00000054 4700650074004C0061- <1>  dw __utf16__(%1)
+    46 0000005D 007300740045007200- <1>
+    46 00000066 72006F007200280029- <1>
+    46 0000006F 0020003D0020002500- <1>
+    46 00000078 6C007500            <1>
+    16 0000007C 0A000000                                dw 10, 0
+    17                                      fmt_chars:  WSTR "FormatMessageW() = %lu chars"
+    17                              <1>  fmt_chars: 
+    46 00000080 46006F0072006D0061- <1>  dw __utf16__(%1)
+    46 00000089 0074004D0065007300- <1>
+    46 00000092 730061006700650057- <1>
+    46 0000009B 002800290020003D00- <1>
+    46 000000A4 200025006C00750020- <1>
+    46 000000AD 006300680061007200- <1>
+    46 000000B6 7300                <1>
+    18 000000B8 0A000000                                dw 10, 0
+    19                                      fmt_fail:   WSTR "FormatMessageW failed, error=%lu"
+    19                              <1>  fmt_fail: 
+    46 000000BC 46006F0072006D0061- <1>  dw __utf16__(%1)
+    46 000000C5 0074004D0065007300- <1>
+    46 000000CE 730061006700650057- <1>
+    46 000000D7 002000660061006900- <1>
+    46 000000E0 6C00650064002C0020- <1>
+    46 000000E9 006500720072006F00- <1>
+    46 000000F2 72003D0025006C0075- <1>
+    46 000000FB 00                  <1>
+    20 000000FC 0A000000                                dw 10, 0
+    21 00000100 0A000000                    fmt_nl:     dw 10, 0
+    22                                      msg_text:   WSTR "system message: "
+    22                              <1>  msg_text: 
+    46 00000104 730079007300740065- <1>  dw __utf16__(%1)
+    46 0000010D 006D0020006D006500- <1>
+    46 00000116 730073006100670065- <1>
+    46 0000011F 003A002000          <1>
+    23 00000124 0000                                    dw 0
+    24                                  
+    25                                  section .bss
+    26 00000000 <res 400h>                  msg_buf:    resw 512            ; 系统错误文本（UTF-16）
+    27 00000400 <res 400h>                  utf8_buf:   resb 1024           ; 转成 UTF-8 后写标准输出
+    28                                  
+    29                                  section .text
+    30                                      global  wmain
+    31                                      extern  wprintf
+    32                                      extern  CreateFileW
+    33                                      extern  GetLastError
+    34                                      extern  FormatMessageW
+    35                                      extern  WideCharToMultiByte
+    36                                      extern  GetStdHandle
+    37                                      extern  WriteFile
+    38                                      extern  fflush
+    39                                  
+    40                                  ; ------------------------------------------------------------
+    41                                  ; void print_utf8(wchar_t *s, int chars)
+    42                                  ;   RCX = 宽字符串，EDX = 码元数
+    43                                  ;   用 WideCharToMultiByte(CP_UTF8) 转码后，直接 WriteFile 到 stdout。
+    44                                  ;   （PowerShell 管道不是控制台句柄，WriteConsoleW 会失败；WriteFile 可靠。）
+    45                                  ; ------------------------------------------------------------
+    46                                  print_utf8:
+    47 00000000 55                          push    rbp
+    48 00000001 4889E5                      mov     rbp, rsp
+    49 00000004 4883EC60                    sub     rsp, 96                 ; 32 影子 + 4 个栈参数 + 本地槽
+    50                                  
+    51 00000008 48894DF8                    mov     qword [rbp - 8], rcx    ; 宽字符串
+    52 0000000C 8955F0                      mov     dword [rbp - 16], edx   ; 码元数
+    53                                  
+    54 0000000F B9E9FD0000                  mov     ecx, CP_UTF8
+    55 00000014 31D2                        xor     edx, edx
+    56 00000016 4C8B45F8                    mov     r8, qword [rbp - 8]
+    57 0000001A 448B4DF0                    mov     r9d, dword [rbp - 16]
+    58 0000001E 488D05(00040000)            lea     rax, [rel utf8_buf]
+    59 00000025 4889442420                  mov     qword [rsp + 32], rax   ; lpMultiByteStr
+    60 0000002A 48C744242800040000          mov     qword [rsp + 40], 1024  ; cbMultiByte
+    61 00000033 48C744243000000000          mov     qword [rsp + 48], NULL  ; lpDefaultChar
+    62 0000003C 48C744243800000000          mov     qword [rsp + 56], NULL  ; lpUsedDefaultChar
+    63 00000045 E8(00000000)                call    WideCharToMultiByte
+    64 0000004A 85C0                        test    eax, eax
+    65 0000004C 7432                        jz      .done
+    66 0000004E 8945E8                      mov     dword [rbp - 24], eax   ; UTF-8 字节数
+    67                                  
+    68 00000051 B9F5FFFFFF                  mov     ecx, STD_OUTPUT_HANDLE
+    69 00000056 E8(00000000)                call    GetStdHandle
+    70 0000005B 488945E0                    mov     qword [rbp - 32], rax
+    71                                  
+    72 0000005F 488B4DE0                    mov     rcx, qword [rbp - 32]
+    73 00000063 488D15(00040000)            lea     rdx, [rel utf8_buf]
+    74 0000006A 448B45E8                    mov     r8d, dword [rbp - 24]
+    75 0000006E 4C8D4DDC                    lea     r9, [rbp - 36]          ; &written
+    76 00000072 48C744242000000000          mov     qword [rsp + 32], NULL  ; lpOverlapped
+    77 0000007B E8(00000000)                call    WriteFile
+    78                                  .done:
+    79 00000080 C9                          leave
+    80 00000081 C3                          ret
+    81                                  
+    82                                  ; ------------------------------------------------------------
+    83                                  ; int wmain(int argc, wchar_t **argv)
+    84                                  ; ------------------------------------------------------------
+    85                                  wmain:
+    86 00000082 55                          push    rbp
+    87 00000083 4889E5                      mov     rbp, rsp
+    88 00000086 4881EC80000000              sub     rsp, 128
+    89                                  
+    90                                  ; ---------- 1. 打开不存在的文件 ----------
+    91 0000008D 488D0D(00000000)            lea     rcx, [rel filename]
+    92 00000094 BA00000080                  mov     edx, GENERIC_READ
+    93 00000099 4531C0                      xor     r8d, r8d
+    94 0000009C 4531C9                      xor     r9d, r9d
+    95 0000009F 48C744242003000000          mov     qword [rsp + 32], OPEN_EXISTING
+    96 000000A8 48C744242880000000          mov     qword [rsp + 40], FILE_ATTRIBUTE_NORMAL
+    97 000000B1 48C744243000000000          mov     qword [rsp + 48], NULL
+    98 000000BA E8(00000000)                call    CreateFileW
+    99 000000BF 488945F8                    mov     qword [rbp - 8], rax
+   100                                  
+   101 000000C3 488D0D(22000000)            lea     rcx, [rel fmt_handle]
+   102 000000CA 4889C2                      mov     rdx, rax
+   103 000000CD 31C0                        xor     eax, eax
+   104 000000CF E8(00000000)                call    wprintf
+   105                                  
+   106                                  ; ---------- 2. 立刻取错误码 ----------
+   107 000000D4 E8(00000000)                call    GetLastError
+   108 000000D9 8945F4                      mov     dword [rbp - 12], eax
+   109                                  
+   110 000000DC 488D0D(54000000)            lea     rcx, [rel fmt_err]
+   111 000000E3 8B55F4                      mov     edx, dword [rbp - 12]
+   112 000000E6 31C0                        xor     eax, eax
+   113 000000E8 E8(00000000)                call    wprintf
+   114                                  
+   115                                  ; ---------- 3. 取系统错误文本（7 参数，后 3 个在栈上） ----------
+   116 000000ED B900120000                  mov     ecx, 0x1200             ; FROM_SYSTEM | IGNORE_INSERTS
+   117 000000F2 31D2                        xor     edx, edx                ; lpSource = NULL
+   118 000000F4 448B45F4                    mov     r8d, dword [rbp - 12]   ; dwMessageId
+   119 000000F8 4531C9                      xor     r9d, r9d                ; dwLanguageId = 0
+   120 000000FB 488D05(00000000)            lea     rax, [rel msg_buf]
+   121 00000102 4889442420                  mov     qword [rsp + 32], rax   ; lpBuffer
+   122 00000107 48C744242800020000          mov     qword [rsp + 40], 512   ; nSize（码元数）
+   123 00000110 48C744243000000000          mov     qword [rsp + 48], NULL  ; Arguments = NULL
+   124 00000119 E8(00000000)                call    FormatMessageW
+   125                                  
+   126 0000011E 85C0                        test    eax, eax
+   127 00000120 744A                        jz      .format_failed
+   128 00000122 8945F0                      mov     dword [rbp - 16], eax   ; 返回的码元数
+   129                                  
+   130 00000125 488D0D(80000000)            lea     rcx, [rel fmt_chars]
+   131 0000012C 8B55F0                      mov     edx, dword [rbp - 16]
+   132 0000012F 31C0                        xor     eax, eax
+   133 00000131 E8(00000000)                call    wprintf
+   134                                  
+   135 00000136 488D0D(04010000)            lea     rcx, [rel msg_text]
+   136 0000013D 31C0                        xor     eax, eax
+   137 0000013F E8(00000000)                call    wprintf
+   138                                  
+   139                                      ; wprintf 有缓冲，WriteFile 没有；先 flush，保证输出顺序
+   140 00000144 31C9                        xor     ecx, ecx
+   141 00000146 E8(00000000)                call    fflush
+   142                                  
+   143 0000014B 488D0D(00000000)            lea     rcx, [rel msg_buf]
+   144 00000152 8B55F0                      mov     edx, dword [rbp - 16]
+   145 00000155 E8A6FEFFFF                  call    print_utf8
+   146                                  
+   147 0000015A 488D0D(00010000)            lea     rcx, [rel fmt_nl]
+   148 00000161 31C0                        xor     eax, eax
+   149 00000163 E8(00000000)                call    wprintf
+   150                                  
+   151 00000168 31C0                        xor     eax, eax
+   152 0000016A C9                          leave
+   153 0000016B C3                          ret
+   154                                  
+   155                                  ; ---------- 失败路径 ----------
+   156                                  .format_failed:
+   157 0000016C E8(00000000)                call    GetLastError
+   158 00000171 8945EC                      mov     dword [rbp - 20], eax
+   159 00000174 488D0D(BC000000)            lea     rcx, [rel fmt_fail]
+   160 0000017B 8B55EC                      mov     edx, dword [rbp - 20]
+   161 0000017E 31C0                        xor     eax, eax
+   162 00000180 E8(00000000)                call    wprintf
+   163 00000185 B801000000                  mov     eax, 1
+   164 0000018A C9                          leave
+   165 0000018B C3                          ret

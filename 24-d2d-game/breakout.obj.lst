@@ -1,0 +1,1241 @@
+     1                                  ; ============================================================
+     2                                  ; 第 24 章：纯汇编 Direct2D 小游戏 —— 弹球打砖块（零 CRT）
+     3                                  ; 构建：make    产物：breakout.exe（GUI 子系统，只编译不运行）
+     4                                  ; 入口 _start；ld 直连：-luser32 -lkernel32 -ld2d1
+     5                                  ; 玩法：← → 移动挡板，ESC 退出；3 条命（左上角圆点），
+     6                                  ;       球落到底丢一命，命用完整局重置；清光砖块立即刷新下一局。
+     7                                  ; ============================================================
+     8                                  %include "../common.asm"
+     1                              <1> ; ============================================================
+     2                              <1> ; common.asm —— 全项目共享定义
+     3                              <1> ; 只包含预处理指令、常量与宏，不产生任何段/数据。
+     4                              <1> ; 用法：在章节目录中写  %include "../common.asm"
+     5                              <1> ; ============================================================
+     6                              <1> 
+     7                              <1> ; ---------- Windows x64 栈约定 ----------
+     8                              <1> %define SHADOW_SPACE          32      ; 调用前必须预留的影子空间
+     9                              <1> %define ENTRY_SUB_RSP         40      ; 入口 RSP%16==8 → 减 40 后 %16==0
+    10                              <1> %define FRAME_SUB_RSP         32      ; push rbp 之后 %16==0 → 再减 32
+    11                              <1> 
+    12                              <1> ; ---------- 通用常量 ----------
+    13                              <1> %define NULL                  0
+    14                              <1> %define TRUE                  1
+    15                              <1> %define FALSE                 0
+    16                              <1> %define WCHAR_SIZE            2       ; UTF-16 码元大小
+    17                              <1> %define MAX_PATH_W            260
+    18                              <1> 
+    19                              <1> ; ---------- 标准设备 ----------
+    20                              <1> %define STD_OUTPUT_HANDLE     -11
+    21                              <1> %define STD_ERROR_HANDLE      -12
+    22                              <1> 
+    23                              <1> ; ---------- 文件 ----------
+    24                              <1> %define INVALID_HANDLE_VALUE  -1
+    25                              <1> %define GENERIC_READ          0x80000000
+    26                              <1> %define GENERIC_WRITE         0x40000000
+    27                              <1> %define CREATE_ALWAYS         2
+    28                              <1> %define OPEN_EXISTING         3
+    29                              <1> %define FILE_ATTRIBUTE_NORMAL 0x80
+    30                              <1> 
+    31                              <1> ; ---------- 错误码 ----------
+    32                              <1> %define ERROR_FILE_NOT_FOUND  2
+    33                              <1> %define ERROR_PATH_NOT_FOUND  3
+    34                              <1> %define ERROR_ACCESS_DENIED   5
+    35                              <1> 
+    36                              <1> ; ---------- 代码页 ----------
+    37                              <1> %define CP_UTF8               65001
+    38                              <1> 
+    39                              <1> ; ---------- 堆 ----------
+    40                              <1> %define HEAP_ZERO_MEMORY      8
+    41                              <1> 
+    42                              <1> ; ---------- 宽字符串宏（UTF-16LE） ----------
+    43                              <1> ; WSTR  ：展开为 UTF-16LE 码元，不带结尾 0
+    44                              <1> ; WSTRZ ：展开为 UTF-16LE 码元，并追加一个 0 结尾
+    45                              <1> %macro WSTR 1
+    46                              <1>     dw __utf16__(%1)
+    47                              <1> %endmacro
+    48                              <1> 
+    49                              <1> %macro WSTRZ 1
+    50                              <1>     dw __utf16__(%1), 0
+    51                              <1> %endmacro
+    52                              <1> 
+    53                              <1> ; ---------- COM 方法调用（第 16 章起） ----------
+    54                              <1> ; 用法：COM_CALL <持有接口指针的寄存器>, <虚表槽位>
+    55                              <1> ; 只破坏 RAX；调用参数必须在宏展开前放进 RCX/RDX/R8/R9 和栈。
+    56                              <1> ; 例：mov rcx, [rel p_rt]  →  rcx = this
+    57                              <1> ;     lea rdx, [rel color]
+    58                              <1> ;     COM_CALL rcx, 47        ; ID2D1RenderTarget::Clear
+    59                              <1> %macro COM_CALL 2
+    60                              <1>     mov  rax, [%1]
+    61                              <1>     call qword [rax + (%2) * 8]
+    62                              <1> %endmacro
+    63                              <1> 
+    64                              <1> ; ---------- 第 12 章：文本统计结构（多个 .asm 共用） ----------
+    65                              <1> struc TEXT_STATS
+    66 00000000 ????????            <1>     .chars: resd 1
+    67 00000004 ????????            <1>     .lines: resd 1
+    68 00000008 ????????            <1>     .words: resd 1
+    69                              <1> endstruc
+    70                              <1> 
+    71                              <1> ; ============================================================
+    72                              <1> ; 第 13 章起：Win32 窗口与消息
+    73                              <1> ; 常量值全部来自 MinGW 头文件（winuser.h / winbase.h）
+    74                              <1> ; ============================================================
+    75                              <1> 
+    76                              <1> %define WS_OVERLAPPEDWINDOW   0x00CF0000
+    77                              <1> %define WS_VISIBLE           0x10000000
+    78                              <1> %define CW_USEDEFAULT        0x80000000
+    79                              <1> %define CS_VREDRAW           0x0001
+    80                              <1> %define CS_HREDRAW           0x0002
+    81                              <1> %define SW_SHOWNORMAL        1
+    82                              <1> %define SW_SHOW              5
+    83                              <1> %define IDC_ARROW            32512
+    84                              <1> %define IDI_APPLICATION      32512
+    85                              <1> %define COLOR_WINDOW         5
+    86                              <1> %define COLOR_WINDOWTEXT     8
+    87                              <1> 
+    88                              <1> %define WM_CREATE            0x0001
+    89                              <1> %define WM_DESTROY           0x0002
+    90                              <1> %define WM_SIZE              0x0005
+    91                              <1> %define WM_ACTIVATE          0x0006
+    92                              <1> %define WM_PAINT             0x000F
+    93                              <1> %define WM_CLOSE             0x0010
+    94                              <1> %define WM_ERASEBKGND        0x0014
+    95                              <1> %define WM_KEYDOWN           0x0100
+    96                              <1> %define WM_KEYUP             0x0101
+    97                              <1> %define WM_CHAR              0x0102
+    98                              <1> %define WM_TIMER             0x0113
+    99                              <1> %define WM_LBUTTONDOWN       0x0201
+   100                              <1> 
+   101                              <1> %define VK_ESCAPE            0x1B
+   102                              <1> %define VK_SPACE             0x20
+   103                              <1> %define VK_LEFT              0x25
+   104                              <1> %define VK_UP                0x26
+   105                              <1> %define VK_RIGHT             0x27
+   106                              <1> %define VK_DOWN              0x28
+   107                              <1> %define PM_REMOVE            0x0001
+   108                              <1> 
+   109                              <1> %define TRANSPARENT          1
+   110                              <1> %define DT_LEFT              0
+   111                              <1> %define DT_TOP               0
+   112                              <1> %define DT_CENTER            0x0001
+   113                              <1> %define DT_SINGLELINE        0x0020
+   114                              <1> 
+   115                              <1> ; WNDCLASSEXW：winuser.h:897-910。x64 下 sizeof == 80。
+   116                              <1> ; 注意 cbClsExtra(16) 与 cbWndExtra(20) 之间没有填充，
+   117                              <1> ; 但 hInstance 位于 24，正好是 8 字节对齐，所以这里不需要手工补位。
+   118                              <1> struc WNDCLASSEXW
+   119 00000000 ????????            <1>     .cbSize:        resd 1      ; +0
+   120 00000004 ????????            <1>     .style:         resd 1      ; +4
+   121 00000008 ????????????????    <1>     .lpfnWndProc:   resq 1      ; +8
+   122 00000010 ????????            <1>     .cbClsExtra:    resd 1      ; +16
+   123 00000014 ????????            <1>     .cbWndExtra:    resd 1      ; +20
+   124 00000018 ????????????????    <1>     .hInstance:     resq 1      ; +24
+   125 00000020 ????????????????    <1>     .hIcon:         resq 1      ; +32
+   126 00000028 ????????????????    <1>     .hCursor:       resq 1      ; +40
+   127 00000030 ????????????????    <1>     .hbrBackground: resq 1      ; +48
+   128 00000038 ????????????????    <1>     .lpszMenuName:  resq 1      ; +56
+   129 00000040 ????????????????    <1>     .lpszClassName: resq 1      ; +64
+   130 00000048 ????????????????    <1>     .hIconSm:       resq 1      ; +72
+   131                              <1> endstruc                        ; = 80
+   132                              <1> 
+   133                              <1> ; MSG：winuser.h:955-961。x64 下 sizeof == 48。
+   134                              <1> ; message 之后有 4 字节隐式填充（wParam 必须 8 对齐），
+   135                              <1> ; 末尾 pt 之后还有 4 字节尾部填充。NASM 的 struc 不会自动补，
+   136                              <1> ; 所以显式写 .pad0 / .pad1。
+   137                              <1> struc MSG
+   138 00000000 ????????????????    <1>     .hwnd:      resq 1          ; +0
+   139 00000008 ????????            <1>     .message:   resd 1          ; +8
+   140 0000000C ????????            <1>     .pad0:      resd 1          ; +12  隐式填充
+   141 00000010 ????????????????    <1>     .wParam:    resq 1          ; +16
+   142 00000018 ????????????????    <1>     .lParam:    resq 1          ; +24
+   143 00000020 ????????            <1>     .time:      resd 1          ; +32
+   144 00000024 ????????            <1>     .pt_x:      resd 1          ; +36
+   145 00000028 ????????            <1>     .pt_y:      resd 1          ; +40
+   146 0000002C ????????            <1>     .pad1:      resd 1          ; +44  尾部填充
+   147                              <1> endstruc                        ; = 48
+   148                              <1> 
+   149                              <1> ; PAINTSTRUCT：winuser.h:1823-1830。x64 下 sizeof == 72。
+   150                              <1> struc PAINTSTRUCT
+   151 00000000 ????????????????    <1>     .hdc:           resq 1      ; +0
+   152 00000008 ????????            <1>     .fErase:        resd 1      ; +8
+   153 0000000C ????????            <1>     .rcPaint_left:  resd 1      ; +12
+   154 00000010 ????????            <1>     .rcPaint_top:   resd 1      ; +16
+   155 00000014 ????????            <1>     .rcPaint_right: resd 1      ; +20
+   156 00000018 ????????            <1>     .rcPaint_bottom:resd 1      ; +24
+   157 0000001C ????????            <1>     .fRestore:      resd 1      ; +28
+   158 00000020 ????????            <1>     .fIncUpdate:    resd 1      ; +32
+   159 00000024 <res 20h>           <1>     .rgbReserved:   resb 32     ; +36
+   160 00000044 ????????            <1>     .pad:           resb 4      ; +68  补齐到 8 的倍数
+   161                              <1> endstruc                        ; = 72
+   162                              <1> 
+   163                              <1> ; RECT：windef.h，4 个 LONG，共 16 字节
+   164                              <1> struc RECT
+   165 00000000 ????????            <1>     .left:   resd 1
+   166 00000004 ????????            <1>     .top:    resd 1
+   167 00000008 ????????            <1>     .right:  resd 1
+   168 0000000C ????????            <1>     .bottom: resd 1
+   169                              <1> endstruc                        ; = 16
+   170                              <1> 
+   171                              <1> ; ============================================================
+   172                              <1> ; 第 17 章起：Direct2D 结构体
+   173                              <1> ; 布局来自 MinGW：d2d1.h / dcommon.h / d2dbasetypes.h
+   174                              <1> ; ============================================================
+   175                              <1> 
+   176                              <1> %define D2D1_FACTORY_TYPE_SINGLE_THREADED  0
+   177                              <1> %define D2D1_FACTORY_TYPE_MULTI_THREADED   1
+   178                              <1> 
+   179                              <1> %define D2D1_RENDER_TARGET_TYPE_DEFAULT    0
+   180                              <1> %define D2D1_RENDER_TARGET_TYPE_HARDWARE   1
+   181                              <1> %define D2D1_RENDER_TARGET_TYPE_SOFTWARE   2
+   182                              <1> 
+   183                              <1> %define D2D1_ALPHA_MODE_UNKNOWN            0
+   184                              <1> %define D2D1_ALPHA_MODE_PREMULTIPLIED      1
+   185                              <1> %define D2D1_ALPHA_MODE_STRAIGHT           2
+   186                              <1> %define D2D1_ALPHA_MODE_IGNORE             3
+   187                              <1> 
+   188                              <1> %define DXGI_FORMAT_UNKNOWN                 0
+   189                              <1> %define DXGI_FORMAT_B8G8R8A8_UNORM          87
+   190                              <1> 
+   191                              <1> %define D2D1_PRESENT_OPTIONS_NONE           0
+   192                              <1> %define D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS 1
+   193                              <1> %define D2D1_PRESENT_OPTIONS_IMMEDIATELY    2
+   194                              <1> 
+   195                              <1> %define D2D1_WINDOW_STATE_NONE              0
+   196                              <1> %define D2D1_WINDOW_STATE_OCCLUDED          1
+   197                              <1> %define D2D1_WINDOW_STATE_HIDDEN            2
+   198                              <1> 
+   199                              <1> ; 虚表槽位（d2d1.h 中 ID2D1RenderTargetVtbl / ID2D1HwndRenderTargetVtbl 的顺序）
+   200                              <1> %define D2D1_RT_CREATE_SOLID_COLOR_BRUSH    8
+   201                              <1> %define D2D1_RT_DRAW_RECTANGLE              16
+   202                              <1> %define D2D1_RT_FILL_RECTANGLE              17
+   203                              <1> %define D2D1_RT_FILL_ELLIPSE                21
+   204                              <1> %define D2D1_RT_CLEAR                       47
+   205                              <1> %define D2D1_RT_BEGIN_DRAW                  48
+   206                              <1> %define D2D1_RT_END_DRAW                    49
+   207                              <1> %define D2D1_HWND_RT_RESIZE                 58
+   208                              <1> %define D2D1_FACTORY_CREATE_HWND_RT         14
+   209                              <1> %define IUNKNOWN_QUERY_INTERFACE            0
+   210                              <1> %define IUNKNOWN_ADD_REF                    1
+   211                              <1> %define IUNKNOWN_RELEASE                    2
+   212                              <1> 
+   213                              <1> ; HRESULT 成功码的常用判断值
+   214                              <1> %define S_OK                                0
+   215                              <1> %define D2DERR_RECREATE_TARGET              0x8899000C
+   216                              <1> 
+   217                              <1> ; D2D1_PIXEL_FORMAT：dcommon.h:68-71，8 字节
+   218                              <1> struc D2D1_PIXEL_FORMAT
+   219 00000000 ????????            <1>     .format:    resd 1          ; DXGI_FORMAT
+   220 00000004 ????????            <1>     .alphaMode: resd 1          ; D2D1_ALPHA_MODE
+   221                              <1> endstruc                        ; = 8
+   222                              <1> 
+   223                              <1> ; D2D1_RENDER_TARGET_PROPERTIES：d2d1.h:453-460，28 字节
+   224                              <1> ; 全部填 0 就是“默认硬件渲染目标 + 未知像素格式”
+   225                              <1> struc D2D1_RENDER_TARGET_PROPERTIES
+   226 00000000 ????????            <1>     .type:                  resd 1   ; +0
+   227 00000004 ????????            <1>     .pixelFormat_format:    resd 1   ; +4
+   228 00000008 ????????            <1>     .pixelFormat_alphaMode: resd 1   ; +8
+   229 0000000C ????????            <1>     .dpiX:                  resd 1   ; +12
+   230 00000010 ????????            <1>     .dpiY:                  resd 1   ; +16
+   231 00000014 ????????            <1>     .usage:                 resd 1   ; +20
+   232 00000018 ????????            <1>     .minLevel:              resd 1   ; +24
+   233                              <1> endstruc                              ; = 28
+   234                              <1> 
+   235                              <1> ; D2D1_HWND_RENDER_TARGET_PROPERTIES：d2d1.h:420-424，24 字节
+   236                              <1> struc D2D1_HWND_RENDER_TARGET_PROPERTIES
+   237 00000000 ????????????????    <1>     .hwnd:           resq 1      ; +0
+   238 00000008 ????????            <1>     .pixelSize_width:  resd 1    ; +8
+   239 0000000C ????????            <1>     .pixelSize_height: resd 1    ; +12
+   240 00000010 ????????            <1>     .presentOptions: resd 1      ; +16
+   241 00000014 ????????            <1>     .pad:            resd 1      ; +20  尾部填充
+   242                              <1> endstruc                          ; = 24
+   243                              <1> 
+   244                              <1> ; D2D1_COLOR_F == D3DCOLORVALUE，4 个 FLOAT，16 字节
+   245                              <1> struc D2D1_COLOR_F
+   246 00000000 ????????            <1>     .r: resd 1
+   247 00000004 ????????            <1>     .g: resd 1
+   248 00000008 ????????            <1>     .b: resd 1
+   249 0000000C ????????            <1>     .a: resd 1
+   250                              <1> endstruc                        ; = 16
+   251                              <1> 
+   252                              <1> ; D2D1_RECT_F == D2D_RECT_F，4 个 FLOAT，16 字节
+   253                              <1> struc D2D1_RECT_F
+   254 00000000 ????????            <1>     .left:   resd 1
+   255 00000004 ????????            <1>     .top:    resd 1
+   256 00000008 ????????            <1>     .right:  resd 1
+   257 0000000C ????????            <1>     .bottom: resd 1
+   258                              <1> endstruc                        ; = 16
+   259                              <1> 
+   260                              <1> ; D2D1_SIZE_U，2 个 UINT32，8 字节
+   261                              <1> struc D2D1_SIZE_U
+   262 00000000 ????????            <1>     .width:  resd 1
+   263 00000004 ????????            <1>     .height: resd 1
+   264                              <1> endstruc                        ; = 8
+   265                              <1> 
+   266                              <1> ; D2D1_ELLIPSE：d2d1.h:405，point + radiusX + radiusY，16 字节
+   267                              <1> struc D2D1_ELLIPSE
+   268 00000000 ????????            <1>     .point_x: resd 1            ; +0
+   269 00000004 ????????            <1>     .point_y: resd 1            ; +4
+   270 00000008 ????????            <1>     .radiusX: resd 1            ; +8
+   271 0000000C ????????            <1>     .radiusY: resd 1            ; +12
+   272                              <1> endstruc                        ; = 16
+   273                              <1> 
+   274                              <1> ; D2D1_FACTORY_OPTIONS：d2d1.h:411-413，4 字节
+   275                              <1> struc D2D1_FACTORY_OPTIONS
+   276 00000000 ????????            <1>     .debugLevel: resd 1
+   277                              <1> endstruc                        ; = 4
+   278                              <1> 
+   279                              <1> ; D2D1_BRUSH_PROPERTIES：d2d1.h:392-395，28 字节
+   280                              <1> struc D2D1_BRUSH_PROPERTIES
+   281 00000000 ????????            <1>     .opacity: resd 1            ; +0
+   282 00000004 ????????            <1>     .m11: resd 1                ; +4
+   283 00000008 ????????            <1>     .m12: resd 1                ; +8
+   284 0000000C ????????            <1>     .m21: resd 1                ; +12
+   285 00000010 ????????            <1>     .m22: resd 1                ; +16
+   286 00000014 ????????            <1>     .m31: resd 1                ; +20
+   287 00000018 ????????            <1>     .m32: resd 1                ; +24
+   288                              <1> endstruc                        ; = 28
+     9                                  
+    10                                  default rel
+    11                                  
+    12                                  extern GetModuleHandleW
+    13                                  extern LoadIconW
+    14                                  extern LoadCursorW
+    15                                  extern RegisterClassExW
+    16                                  extern CreateWindowExW
+    17                                  extern ShowWindow
+    18                                  extern UpdateWindow
+    19                                  extern GetMessageW
+    20                                  extern TranslateMessage
+    21                                  extern DispatchMessageW
+    22                                  extern DefWindowProcW
+    23                                  extern PostQuitMessage
+    24                                  extern DestroyWindow
+    25                                  extern InvalidateRect
+    26                                  extern SetTimer
+    27                                  extern KillTimer
+    28                                  extern D2D1CreateFactory
+    29                                  extern ExitProcess
+    30                                  
+    31                                  global _start
+    32                                  
+    33                                  ; ---------- 游戏常量（逻辑坐标 = 像素，场地固定 640x480） ----------
+    34                                  %define BRICK_COUNT   32          ; 8 列 x 4 行
+    35                                  
+    36                                  section .data
+    37                                  class_name:   WSTRZ "MasmLearnD2DBreakout"
+    37                              <1> class_name: 
+    50 00000000 4D00610073006D004C- <1>  dw __utf16__(%1), 0
+    50 00000009 006500610072006E00- <1>
+    50 00000012 440032004400420072- <1>
+    50 0000001B 00650061006B006F00- <1>
+    50 00000024 750074000000        <1>
+    38                                  window_title: WSTRZ "x64 assembly - D2D breakout (no CRT)"
+    38                              <1> window_title: 
+    50 0000002A 780036003400200061- <1>  dw __utf16__(%1), 0
+    50 00000033 007300730065006D00- <1>
+    50 0000003C 62006C00790020002D- <1>
+    50 00000045 002000440032004400- <1>
+    50 0000004E 200062007200650061- <1>
+    50 00000057 006B006F0075007400- <1>
+    50 00000060 200028006E006F0020- <1>
+    50 00000069 004300520054002900- <1>
+    50 00000072 0000                <1>
+    39                                  
+    40                                  iid_d2d1factory:
+    41 00000074 47221506506F5A46            db 0x47, 0x22, 0x15, 0x06, 0x50, 0x6F, 0x5A, 0x46
+    42 0000007C 9245118BFD3B6007            db 0x92, 0x45, 0x11, 0x8B, 0xFD, 0x3B, 0x60, 0x07
+    43                                  
+    44                                  ; ---- 颜色 ----
+    45                                  clear_color:
+    46                                      istruc D2D1_COLOR_F
+    47 00000084 0AD7A33D                        at D2D1_COLOR_F.r, dd 0.08
+    48 00000088 EC51B83D                        at D2D1_COLOR_F.g, dd 0.09
+    49 0000008C 8FC2F53D                        at D2D1_COLOR_F.b, dd 0.12
+    50 00000090 0000803F                        at D2D1_COLOR_F.a, dd 1.0
+    51                                      iend
+    52                                  brick_color:
+    53                                      istruc D2D1_COLOR_F
+    54 00000094 9A99593F                        at D2D1_COLOR_F.r, dd 0.85
+    55 00000098 6666E63E                        at D2D1_COLOR_F.g, dd 0.45
+    56 0000009C 9A99193E                        at D2D1_COLOR_F.b, dd 0.15
+    57 000000A0 0000803F                        at D2D1_COLOR_F.a, dd 1.0
+    58                                      iend
+    59                                  paddle_color:
+    60                                      istruc D2D1_COLOR_F
+    61 000000A4 0000803E                        at D2D1_COLOR_F.r, dd 0.25
+    62 000000A8 9A99193F                        at D2D1_COLOR_F.g, dd 0.60
+    63 000000AC 6666663F                        at D2D1_COLOR_F.b, dd 0.90
+    64 000000B0 0000803F                        at D2D1_COLOR_F.a, dd 1.0
+    65                                      iend
+    66                                  ball_color:
+    67                                      istruc D2D1_COLOR_F
+    68 000000B4 3333733F                        at D2D1_COLOR_F.r, dd 0.95
+    69 000000B8 9A99593F                        at D2D1_COLOR_F.g, dd 0.85
+    70 000000BC 9A99993E                        at D2D1_COLOR_F.b, dd 0.30
+    71 000000C0 0000803F                        at D2D1_COLOR_F.a, dd 1.0
+    72                                      iend
+    73                                  
+    74                                  ; ---- 浮点常量（dd 立即数由 NASM 转成 IEEE754 单精度位型） ----
+    75 000000C4 00000000                c_zero:       dd 0.0
+    76 000000C8 000080BF                c_neg1:       dd -1.0             ; 乘 -1 = 速度反向
+    77 000000CC 00000041                c_ball_r:     dd 8.0
+    78 000000D0 00001E44                c_ball_maxx:  dd 632.0            ; 640 - r
+    79 000000D4 0000F443                c_ball_dead:  dd 488.0            ; 球心越过这条线 = 丢命
+    80 000000D8 0000A043                c_ball_x0:    dd 320.0
+    81 000000DC 00007043                c_ball_y0:    dd 240.0
+    82 000000E0 00004040                c_ball_vx0:   dd 3.0
+    83 000000E4 000080C0                c_ball_vy0:   dd -4.0
+    84 000000E8 0000E143                c_paddle_y:   dd 450.0
+    85 000000EC 0000C842                c_paddle_w:   dd 100.0
+    86 000000F0 00004041                c_paddle_h:   dd 12.0
+    87 000000F4 00000744                c_paddle_max: dd 540.0            ; 640 - 100
+    88 000000F8 00000041                c_paddle_spd: dd 8.0              ; 每帧像素
+    89 000000FC 00008743                c_paddle_x0:  dd 270.0            ; (640-100)/2
+    90 00000100 00009042                c_brick_w:    dd 72.0
+    91 00000104 0000A041                c_brick_h:    dd 20.0
+    92 00000108 0000C040                c_life_r:     dd 6.0
+    93                                  
+    94                                  section .bss
+    95 00000000 <res 50h>               wndclass:   resb WNDCLASSEXW_size
+    96 00000050 <res 30h>               msg:        resb MSG_size
+    97 00000080 ????????????????        hwnd:       resq 1
+    98 00000088 ????????????????        hinst:      resq 1
+    99                                  
+   100 00000090 <res 1Ch>               rt_props:   resb D2D1_RENDER_TARGET_PROPERTIES_size
+   101 000000AC <res 18h>               hwnd_props: resb D2D1_HWND_RENDER_TARGET_PROPERTIES_size
+   102 000000C4 ????????????????        size_u:     resb D2D1_SIZE_U_size
+   103                                  
+   104 000000CC ????????????????        p_factory:  resq 1
+   105 000000D4 ????????????????        p_rt:       resq 1
+   106 000000DC ????????????????        p_brick:    resq 1
+   107 000000E4 ????????????????        p_paddle:   resq 1
+   108 000000EC ????????????????        p_ball:     resq 1
+   109                                  
+   110 000000F4 ????????                g_width:    resd 1
+   111 000000F8 ????????                g_height:   resd 1
+   112                                  
+   113 000000FC <res 10h>               draw_rect:    resb D2D1_RECT_F_size
+   114 0000010C <res 10h>               draw_ellipse: resb D2D1_ELLIPSE_size
+   115                                  
+   116                                  ; ---- 游戏状态 ----
+   117 0000011C ????????                ball_x:     resd 1                ; 全部是 float
+   118 00000120 ????????                ball_y:     resd 1
+   119 00000124 ????????                ball_vx:    resd 1
+   120 00000128 ????????                ball_vy:    resd 1
+   121 0000012C ????????                paddle_x:   resd 1
+   122 00000130 ????????                lives:      resd 1
+   123 00000134 ????????                key_left:   resd 1                ; WM_KEYDOWN/UP 维护的按键状态
+   124 00000138 ????????                key_right:  resd 1
+   125 0000013C <res 80h>               bricks:     resd BRICK_COUNT      ; 1 = 存活，0 = 已击碎
+   126                                  
+   127                                  section .text
+   128                                  
+   129                                  ; ------------------------------------------------------------
+   130                                  ; reset_ball：球回中场，初速 (3, -4)。叶子函数，只用易失寄存器。
+   131                                  ; ------------------------------------------------------------
+   132                                  reset_ball:
+   133 00000000 F30F1005(D8000000)          movss   xmm0, [rel c_ball_x0]
+   134 00000008 F30F1105(1C010000)          movss   [rel ball_x], xmm0
+   135 00000010 F30F1005(DC000000)          movss   xmm0, [rel c_ball_y0]
+   136 00000018 F30F1105(20010000)          movss   [rel ball_y], xmm0
+   137 00000020 F30F1005(E0000000)          movss   xmm0, [rel c_ball_vx0]
+   138 00000028 F30F1105(24010000)          movss   [rel ball_vx], xmm0
+   139 00000030 F30F1005(E4000000)          movss   xmm0, [rel c_ball_vy0]
+   140 00000038 F30F1105(28010000)          movss   [rel ball_vy], xmm0
+   141 00000040 C3                          ret
+   142                                  
+   143                                  ; ------------------------------------------------------------
+   144                                  ; reset_bricks：32 块砖全部置 1。叶子函数。
+   145                                  ; 注意：[rel bricks + rcx*4] 非法——RIP 相对寻址不能带变址寄存器，
+   146                                  ; 必须先 lea 取绝对地址再 [rdx + rcx*4]。
+   147                                  ; ------------------------------------------------------------
+   148                                  reset_bricks:
+   149 00000041 488D15(3C010000)            lea     rdx, [rel bricks]
+   150 00000048 31C9                        xor     ecx, ecx
+   151 0000004A B801000000                  mov     eax, 1
+   152                                  .loop:
+   153 0000004F 89048A                      mov     [rdx + rcx*4], eax
+   154 00000052 FFC1                        inc     ecx
+   155 00000054 83F920                      cmp     ecx, BRICK_COUNT
+   156 00000057 72F6                        jb      .loop
+   157 00000059 C3                          ret
+   158                                  
+   159                                  ; ------------------------------------------------------------
+   160                                  ; reset_game：整局重置（命 = 3，挡板居中，砖与球复位）
+   161                                  ; ------------------------------------------------------------
+   162                                  reset_game:
+   163 0000005A 55                          push    rbp
+   164 0000005B 4889E5                      mov     rbp, rsp
+   165 0000005E 4883EC20                    sub     rsp, FRAME_SUB_RSP
+   166                                  
+   167 00000062 C705(30010000)0300-         mov     dword [rel lives], 3
+   167 0000006A 0000               
+   168 0000006C F30F1005(FC000000)          movss   xmm0, [rel c_paddle_x0]
+   169 00000074 F30F1105(2C010000)          movss   [rel paddle_x], xmm0
+   170 0000007C E8C0FFFFFF                  call    reset_bricks
+   171 00000081 E87AFFFFFF                  call    reset_ball
+   172                                  
+   173 00000086 C9                          leave
+   174 00000087 C3                          ret
+   175                                  
+   176                                  ; ------------------------------------------------------------
+   177                                  ; release_scene：释放 3 个画刷与渲染目标（不释放工厂）
+   178                                  ; ------------------------------------------------------------
+   179                                  release_scene:
+   180 00000088 55                          push    rbp
+   181 00000089 4889E5                      mov     rbp, rsp
+   182 0000008C 4883EC20                    sub     rsp, FRAME_SUB_RSP
+   183                                  
+   184 00000090 488B0D(DC000000)            mov     rcx, [rel p_brick]
+   185 00000097 4885C9                      test    rcx, rcx
+   186 0000009A 7411                        jz      .no_brick
+   187                                      COM_CALL rcx, IUNKNOWN_RELEASE
+    60 0000009C 488B01              <1>  mov rax, [%1]
+    61 0000009F FF5010              <1>  call qword [rax + (%2) * 8]
+   188 000000A2 48C705(DC000000)00-         mov     qword [rel p_brick], 0
+   188 000000AA 000000             
+   189                                  .no_brick:
+   190 000000AD 488B0D(E4000000)            mov     rcx, [rel p_paddle]
+   191 000000B4 4885C9                      test    rcx, rcx
+   192 000000B7 7411                        jz      .no_paddle
+   193                                      COM_CALL rcx, IUNKNOWN_RELEASE
+    60 000000B9 488B01              <1>  mov rax, [%1]
+    61 000000BC FF5010              <1>  call qword [rax + (%2) * 8]
+   194 000000BF 48C705(E4000000)00-         mov     qword [rel p_paddle], 0
+   194 000000C7 000000             
+   195                                  .no_paddle:
+   196 000000CA 488B0D(EC000000)            mov     rcx, [rel p_ball]
+   197 000000D1 4885C9                      test    rcx, rcx
+   198 000000D4 7411                        jz      .no_ball
+   199                                      COM_CALL rcx, IUNKNOWN_RELEASE
+    60 000000D6 488B01              <1>  mov rax, [%1]
+    61 000000D9 FF5010              <1>  call qword [rax + (%2) * 8]
+   200 000000DC 48C705(EC000000)00-         mov     qword [rel p_ball], 0
+   200 000000E4 000000             
+   201                                  .no_ball:
+   202 000000E7 488B0D(D4000000)            mov     rcx, [rel p_rt]
+   203 000000EE 4885C9                      test    rcx, rcx
+   204 000000F1 7411                        jz      .no_rt
+   205                                      COM_CALL rcx, IUNKNOWN_RELEASE
+    60 000000F3 488B01              <1>  mov rax, [%1]
+    61 000000F6 FF5010              <1>  call qword [rax + (%2) * 8]
+   206 000000F9 48C705(D4000000)00-         mov     qword [rel p_rt], 0
+   206 00000101 000000             
+   207                                  .no_rt:
+   208 00000104 C9                          leave
+   209 00000105 C3                          ret
+   210                                  
+   211                                  ; ------------------------------------------------------------
+   212                                  ; create_render_target：创建 RT + 3 个画刷
+   213                                  ; 返回 EAX = 0 成功；1 没有工厂；2 画刷失败；3 RT 失败
+   214                                  ; ------------------------------------------------------------
+   215                                  create_render_target:
+   216 00000106 55                          push    rbp
+   217 00000107 4889E5                      mov     rbp, rsp
+   218 0000010A 4883EC40                    sub     rsp, 64
+   219                                  
+   220 0000010E 488B05(CC000000)            mov     rax, [rel p_factory]
+   221 00000115 4885C0                      test    rax, rax
+   222 00000118 0F84E6000000                jz      .no_factory
+   223                                  
+   224 0000011E 488D3D(90000000)            lea     rdi, [rel rt_props]
+   225 00000125 31C0                        xor     eax, eax
+   226 00000127 B907000000                  mov     ecx, D2D1_RENDER_TARGET_PROPERTIES_size / 4
+   227 0000012C F3AB                        rep     stosd
+   228                                  
+   229 0000012E 488D3D(AC000000)            lea     rdi, [rel hwnd_props]
+   230 00000135 31C0                        xor     eax, eax
+   231 00000137 B906000000                  mov     ecx, D2D1_HWND_RENDER_TARGET_PROPERTIES_size / 4
+   232 0000013C F3AB                        rep     stosd
+   233                                  
+   234 0000013E 488D05(AC000000)            lea     rax, [rel hwnd_props]
+   235 00000145 488B0D(80000000)            mov     rcx, [rel hwnd]
+   236 0000014C 488908                      mov     [rax + D2D1_HWND_RENDER_TARGET_PROPERTIES.hwnd], rcx
+   237 0000014F 8B0D(F4000000)              mov     ecx, [rel g_width]
+   238 00000155 894808                      mov     [rax + D2D1_HWND_RENDER_TARGET_PROPERTIES.pixelSize_width], ecx
+   239 00000158 8B0D(F8000000)              mov     ecx, [rel g_height]
+   240 0000015E 89480C                      mov     [rax + D2D1_HWND_RENDER_TARGET_PROPERTIES.pixelSize_height], ecx
+   241                                  
+   242 00000161 488B0D(CC000000)            mov     rcx, [rel p_factory]
+   243 00000168 488D15(90000000)            lea     rdx, [rel rt_props]
+   244 0000016F 4C8D05(AC000000)            lea     r8,  [rel hwnd_props]
+   245 00000176 4C8D0D(D4000000)            lea     r9,  [rel p_rt]
+   246                                      COM_CALL rcx, D2D1_FACTORY_CREATE_HWND_RT
+    60 0000017D 488B01              <1>  mov rax, [%1]
+    61 00000180 FF5070              <1>  call qword [rax + (%2) * 8]
+   247 00000183 85C0                        test    eax, eax
+   248 00000185 7576                        jnz     .fail_create
+   249                                  
+   250 00000187 488B0D(D4000000)            mov     rcx, [rel p_rt]
+   251 0000018E 488D15(94000000)            lea     rdx, [rel brick_color]
+   252 00000195 4531C0                      xor     r8d, r8d
+   253 00000198 4C8D0D(DC000000)            lea     r9,  [rel p_brick]
+   254                                      COM_CALL rcx, D2D1_RT_CREATE_SOLID_COLOR_BRUSH
+    60 0000019F 488B01              <1>  mov rax, [%1]
+    61 000001A2 FF5040              <1>  call qword [rax + (%2) * 8]
+   255 000001A5 85C0                        test    eax, eax
+   256 000001A7 7548                        jnz     .fail_brush
+   257                                  
+   258 000001A9 488B0D(D4000000)            mov     rcx, [rel p_rt]
+   259 000001B0 488D15(A4000000)            lea     rdx, [rel paddle_color]
+   260 000001B7 4531C0                      xor     r8d, r8d
+   261 000001BA 4C8D0D(E4000000)            lea     r9,  [rel p_paddle]
+   262                                      COM_CALL rcx, D2D1_RT_CREATE_SOLID_COLOR_BRUSH
+    60 000001C1 488B01              <1>  mov rax, [%1]
+    61 000001C4 FF5040              <1>  call qword [rax + (%2) * 8]
+   263 000001C7 85C0                        test    eax, eax
+   264 000001C9 7526                        jnz     .fail_brush
+   265                                  
+   266 000001CB 488B0D(D4000000)            mov     rcx, [rel p_rt]
+   267 000001D2 488D15(B4000000)            lea     rdx, [rel ball_color]
+   268 000001D9 4531C0                      xor     r8d, r8d
+   269 000001DC 4C8D0D(EC000000)            lea     r9,  [rel p_ball]
+   270                                      COM_CALL rcx, D2D1_RT_CREATE_SOLID_COLOR_BRUSH
+    60 000001E3 488B01              <1>  mov rax, [%1]
+    61 000001E6 FF5040              <1>  call qword [rax + (%2) * 8]
+   271 000001E9 85C0                        test    eax, eax
+   272 000001EB 7504                        jnz     .fail_brush
+   273                                  
+   274 000001ED 31C0                        xor     eax, eax
+   275 000001EF C9                          leave
+   276 000001F0 C3                          ret
+   277                                  
+   278                                  .fail_brush:
+   279 000001F1 E892FEFFFF                  call    release_scene
+   280 000001F6 B802000000                  mov     eax, 2
+   281 000001FB C9                          leave
+   282 000001FC C3                          ret
+   283                                  
+   284                                  .fail_create:
+   285 000001FD B803000000                  mov     eax, 3
+   286 00000202 C9                          leave
+   287 00000203 C3                          ret
+   288                                  
+   289                                  .no_factory:
+   290 00000204 B801000000                  mov     eax, 1
+   291 00000209 C9                          leave
+   292 0000020A C3                          ret
+   293                                  
+   294                                  ; ------------------------------------------------------------
+   295                                  ; update_game：每帧（WM_TIMER, 16ms）推进一步游戏逻辑
+   296                                  ; 帧布局：push rbp → push rbx → sub 40；入口%16==8 → 对齐
+   297                                  ; ------------------------------------------------------------
+   298                                  update_game:
+   299 0000020B 55                          push    rbp
+   300 0000020C 4889E5                      mov     rbp, rsp
+   301 0000020F 53                          push    rbx
+   302 00000210 4883EC28                    sub     rsp, 40
+   303                                  
+   304                                      ; ---- 挡板：按住 ←/→ 连续移动（按键状态而非单次消息） ----
+   305 00000214 833D(34010000)00            cmp     dword [rel key_left], 0
+   306 0000021B 7424                        je      .no_left
+   307 0000021D F30F1005(2C010000)          movss   xmm0, [rel paddle_x]
+   308 00000225 F30F5C05(F8000000)          subss   xmm0, [rel c_paddle_spd]
+   309 0000022D 0F2F05(C4000000)            comiss  xmm0, [rel c_zero]          ; 左边界 clamp：xmm0 < 0 → CF=1
+   310 00000234 7303                        jae     .store_left
+   311 00000236 0F57C0                      xorps   xmm0, xmm0
+   312                                  .store_left:
+   313 00000239 F30F1105(2C010000)          movss   [rel paddle_x], xmm0
+   314                                  .no_left:
+   315 00000241 833D(38010000)00            cmp     dword [rel key_right], 0
+   316 00000248 7429                        je      .no_right
+   317 0000024A F30F1005(2C010000)          movss   xmm0, [rel paddle_x]
+   318 00000252 F30F5805(F8000000)          addss   xmm0, [rel c_paddle_spd]
+   319 0000025A 0F2F05(F4000000)            comiss  xmm0, [rel c_paddle_max]
+   320 00000261 7608                        jbe     .store_right
+   321 00000263 F30F1005(F4000000)          movss   xmm0, [rel c_paddle_max]
+   322                                  .store_right:
+   323 0000026B F30F1105(2C010000)          movss   [rel paddle_x], xmm0
+   324                                  .no_right:
+   325                                  
+   326                                      ; ---- 球：位置积分 ----
+   327 00000273 F30F1005(1C010000)          movss   xmm0, [rel ball_x]
+   328 0000027B F30F5805(24010000)          addss   xmm0, [rel ball_vx]
+   329 00000283 F30F1105(1C010000)          movss   [rel ball_x], xmm0
+   330 0000028B F30F1005(20010000)          movss   xmm0, [rel ball_y]
+   331 00000293 F30F5805(28010000)          addss   xmm0, [rel ball_vy]
+   332 0000029B F30F1105(20010000)          movss   [rel ball_y], xmm0
+   333                                  
+   334                                      ; ---- 左墙 ----
+   335 000002A3 F30F1005(1C010000)          movss   xmm0, [rel ball_x]
+   336 000002AB 0F2F05(CC000000)            comiss  xmm0, [rel c_ball_r]
+   337 000002B2 7328                        jae     .no_wall_l
+   338 000002B4 F30F1005(CC000000)          movss   xmm0, [rel c_ball_r]
+   339 000002BC F30F1105(1C010000)          movss   [rel ball_x], xmm0
+   340 000002C4 F30F1005(24010000)          movss   xmm0, [rel ball_vx]
+   341 000002CC F30F5905(C8000000)          mulss   xmm0, [rel c_neg1]
+   342 000002D4 F30F1105(24010000)          movss   [rel ball_vx], xmm0
+   343                                  .no_wall_l:
+   344                                      ; ---- 右墙 ----
+   345 000002DC F30F1005(1C010000)          movss   xmm0, [rel ball_x]
+   346 000002E4 0F2F05(D0000000)            comiss  xmm0, [rel c_ball_maxx]
+   347 000002EB 7628                        jbe     .no_wall_r
+   348 000002ED F30F1005(D0000000)          movss   xmm0, [rel c_ball_maxx]
+   349 000002F5 F30F1105(1C010000)          movss   [rel ball_x], xmm0
+   350 000002FD F30F1005(24010000)          movss   xmm0, [rel ball_vx]
+   351 00000305 F30F5905(C8000000)          mulss   xmm0, [rel c_neg1]
+   352 0000030D F30F1105(24010000)          movss   [rel ball_vx], xmm0
+   353                                  .no_wall_r:
+   354                                      ; ---- 顶墙 ----
+   355 00000315 F30F1005(20010000)          movss   xmm0, [rel ball_y]
+   356 0000031D 0F2F05(CC000000)            comiss  xmm0, [rel c_ball_r]
+   357 00000324 7328                        jae     .no_wall_t
+   358 00000326 F30F1005(CC000000)          movss   xmm0, [rel c_ball_r]
+   359 0000032E F30F1105(20010000)          movss   [rel ball_y], xmm0
+   360 00000336 F30F1005(28010000)          movss   xmm0, [rel ball_vy]
+   361 0000033E F30F5905(C8000000)          mulss   xmm0, [rel c_neg1]
+   362 00000346 F30F1105(28010000)          movss   [rel ball_vy], xmm0
+   363                                  .no_wall_t:
+   364                                  
+   365                                      ; ---- 挡板碰撞（仅下落时 vy > 0 才检测） ----
+   366 0000034E F30F1005(28010000)          movss   xmm0, [rel ball_vy]
+   367 00000356 0F2F05(C4000000)            comiss  xmm0, [rel c_zero]
+   368 0000035D 0F86B0000000                jbe     .no_paddle
+   369 00000363 F30F1005(20010000)          movss   xmm0, [rel ball_y]
+   370 0000036B F30F5805(CC000000)          addss   xmm0, [rel c_ball_r]
+   371 00000373 0F2F05(E8000000)            comiss  xmm0, [rel c_paddle_y]      ; 球底 < 挡板顶 → 跳过
+   372 0000037A 0F8293000000                jb      .no_paddle
+   373 00000380 F30F1005(20010000)          movss   xmm0, [rel ball_y]
+   374 00000388 F30F5C05(CC000000)          subss   xmm0, [rel c_ball_r]
+   375 00000390 F30F100D(E8000000)          movss   xmm1, [rel c_paddle_y]
+   376 00000398 F30F580D(F0000000)          addss   xmm1, [rel c_paddle_h]
+   377 000003A0 0F2FC1                      comiss  xmm0, xmm1                  ; 球顶 > 挡板底 → 跳过
+   378 000003A3 776E                        ja      .no_paddle
+   379 000003A5 F30F1005(1C010000)          movss   xmm0, [rel ball_x]
+   380 000003AD F30F5805(CC000000)          addss   xmm0, [rel c_ball_r]
+   381 000003B5 0F2F05(2C010000)            comiss  xmm0, [rel paddle_x]        ; 球右缘 < 挡板左缘 → 跳过
+   382 000003BC 7255                        jb      .no_paddle
+   383 000003BE F30F1005(1C010000)          movss   xmm0, [rel ball_x]
+   384 000003C6 F30F5C05(CC000000)          subss   xmm0, [rel c_ball_r]
+   385 000003CE F30F100D(2C010000)          movss   xmm1, [rel paddle_x]
+   386 000003D6 F30F580D(EC000000)          addss   xmm1, [rel c_paddle_w]
+   387 000003DE 0F2FC1                      comiss  xmm0, xmm1                  ; 球左缘 > 挡板右缘 → 跳过
+   388 000003E1 7730                        ja      .no_paddle
+   389                                      ; 命中：球贴回挡板顶，vy 反向
+   390 000003E3 F30F1005(E8000000)          movss   xmm0, [rel c_paddle_y]
+   391 000003EB F30F5C05(CC000000)          subss   xmm0, [rel c_ball_r]
+   392 000003F3 F30F1105(20010000)          movss   [rel ball_y], xmm0
+   393 000003FB F30F1005(28010000)          movss   xmm0, [rel ball_vy]
+   394 00000403 F30F5905(C8000000)          mulss   xmm0, [rel c_neg1]
+   395 0000040B F30F1105(28010000)          movss   [rel ball_vy], xmm0
+   396                                  .no_paddle:
+   397                                  
+   398                                      ; ---- 砖块碰撞：球的 AABB 与砖的 AABB 重叠检测 ----
+   399                                      ; 砖 i：col = i & 7，row = i >> 3
+   400                                      ; left = 18 + col*76，top = 40 + row*24（76=72+4 缝隙，24=20+4）
+   401 00000413 4C8D15(3C010000)            lea     r10, [rel bricks]
+   402 0000041A 31DB                        xor     ebx, ebx
+   403                                  .brick_loop:
+   404 0000041C 83FB20                      cmp     ebx, BRICK_COUNT
+   405 0000041F 0F83BE000000                jae     .brick_done
+   406 00000425 41833C9A00                  cmp     dword [r10 + rbx*4], 0
+   407 0000042A 0F84AC000000                je      .brick_next
+   408                                  
+   409 00000430 89D8                        mov     eax, ebx
+   410 00000432 83E007                      and     eax, 7
+   411 00000435 6BC04C                      imul    eax, eax, 76
+   412 00000438 83C012                      add     eax, 18
+   413 0000043B F30F2AC8                    cvtsi2ss xmm1, eax                  ; xmm1 = brick_left
+   414 0000043F 89D8                        mov     eax, ebx
+   415 00000441 C1E803                      shr     eax, 3
+   416 00000444 6BC018                      imul    eax, eax, 24
+   417 00000447 83C028                      add     eax, 40
+   418 0000044A F30F2AD0                    cvtsi2ss xmm2, eax                  ; xmm2 = brick_top
+   419                                  
+   420 0000044E F30F1005(1C010000)          movss   xmm0, [rel ball_x]
+   421 00000456 F30F5805(CC000000)          addss   xmm0, [rel c_ball_r]        ; 球右缘 <= 砖左缘 → 无碰撞
+   422 0000045E 0F2FC1                      comiss  xmm0, xmm1
+   423 00000461 7679                        jbe     .brick_next
+   424 00000463 F30F1005(1C010000)          movss   xmm0, [rel ball_x]
+   425 0000046B F30F5C05(CC000000)          subss   xmm0, [rel c_ball_r]        ; 球左缘 >= 砖右缘 → 无碰撞
+   426 00000473 F30F10D9                    movss   xmm3, xmm1
+   427 00000477 F30F581D(00010000)          addss   xmm3, [rel c_brick_w]
+   428 0000047F 0F2FC3                      comiss  xmm0, xmm3
+   429 00000482 7358                        jae     .brick_next
+   430 00000484 F30F1005(20010000)          movss   xmm0, [rel ball_y]
+   431 0000048C F30F5805(CC000000)          addss   xmm0, [rel c_ball_r]        ; 球底缘 <= 砖顶缘 → 无碰撞
+   432 00000494 0F2FC2                      comiss  xmm0, xmm2
+   433 00000497 7643                        jbe     .brick_next
+   434 00000499 F30F1005(20010000)          movss   xmm0, [rel ball_y]
+   435 000004A1 F30F5C05(CC000000)          subss   xmm0, [rel c_ball_r]        ; 球顶缘 >= 砖底缘 → 无碰撞
+   436 000004A9 F30F10DA                    movss   xmm3, xmm2
+   437 000004AD F30F581D(04010000)          addss   xmm3, [rel c_brick_h]
+   438 000004B5 0F2FC3                      comiss  xmm0, xmm3
+   439 000004B8 7322                        jae     .brick_next
+   440                                  
+   441                                      ; 命中：砖碎、vy 反向、本帧不再检测其他砖
+   442 000004BA 41C7049A00000000            mov     dword [r10 + rbx*4], 0
+   443 000004C2 F30F1005(28010000)          movss   xmm0, [rel ball_vy]
+   444 000004CA F30F5905(C8000000)          mulss   xmm0, [rel c_neg1]
+   445 000004D2 F30F1105(28010000)          movss   [rel ball_vy], xmm0
+   446 000004DA EB07                        jmp     .brick_done
+   447                                  .brick_next:
+   448 000004DC FFC3                        inc     ebx
+   449 000004DE E939FFFFFF                  jmp     .brick_loop
+   450                                  .brick_done:
+   451                                  
+   452                                      ; ---- 球落底：丢命 ----
+   453 000004E3 F30F1005(20010000)          movss   xmm0, [rel ball_y]
+   454 000004EB 0F2F05(D4000000)            comiss  xmm0, [rel c_ball_dead]
+   455 000004F2 7614                        jbe     .no_lose
+   456 000004F4 FF0D(30010000)              dec     dword [rel lives]
+   457 000004FA 7407                        jz      .game_over
+   458 000004FC E8FFFAFFFF                  call    reset_ball                  ; 还有命：只重置球
+   459 00000501 EB05                        jmp     .no_lose
+   460                                  .game_over:
+   461 00000503 E852FBFFFF                  call    reset_game                  ; 命用完：整局重置
+   462                                  .no_lose:
+   463                                  
+   464                                      ; ---- 通关检测：32 块砖全碎则刷新下一局 ----
+   465 00000508 4C8D15(3C010000)            lea     r10, [rel bricks]
+   466 0000050F 31DB                        xor     ebx, ebx
+   467 00000511 31C0                        xor     eax, eax
+   468                                  .win_scan:
+   469 00000513 83FB20                      cmp     ebx, BRICK_COUNT
+   470 00000516 7308                        jae     .win_scan_done
+   471 00000518 410B049A                    or      eax, [r10 + rbx*4]          ; 有任何一块存活，eax != 0
+   472 0000051C FFC3                        inc     ebx
+   473 0000051E EBF3                        jmp     .win_scan
+   474                                  .win_scan_done:
+   475 00000520 85C0                        test    eax, eax
+   476 00000522 750A                        jnz     .not_won
+   477 00000524 E818FBFFFF                  call    reset_bricks
+   478 00000529 E8D2FAFFFF                  call    reset_ball
+   479                                  .not_won:
+   480                                  
+   481 0000052E 4883C428                    add     rsp, 40
+   482 00000532 5B                          pop     rbx
+   483 00000533 5D                          pop     rbp
+   484 00000534 C3                          ret
+   485                                  
+   486                                  ; ------------------------------------------------------------
+   487                                  ; draw_scene：画一帧。返回 EAX = EndDraw 的 HRESULT
+   488                                  ; 帧布局：push rbp → push rbx → push rsi → sub 48
+   489                                  ; ------------------------------------------------------------
+   490                                  draw_scene:
+   491 00000535 55                          push    rbp
+   492 00000536 4889E5                      mov     rbp, rsp
+   493 00000539 53                          push    rbx
+   494 0000053A 56                          push    rsi
+   495 0000053B 4883EC30                    sub     rsp, 48
+   496                                  
+   497 0000053F 488B0D(D4000000)            mov     rcx, [rel p_rt]
+   498                                      COM_CALL rcx, D2D1_RT_BEGIN_DRAW
+    60 00000546 488B01              <1>  mov rax, [%1]
+    61 00000549 FF9080010000        <1>  call qword [rax + (%2) * 8]
+   499                                  
+   500 0000054F 488B0D(D4000000)            mov     rcx, [rel p_rt]
+   501 00000556 488D15(84000000)            lea     rdx, [rel clear_color]
+   502                                      COM_CALL rcx, D2D1_RT_CLEAR
+    60 0000055D 488B01              <1>  mov rax, [%1]
+    61 00000560 FF9078010000        <1>  call qword [rax + (%2) * 8]
+   503                                  
+   504                                      ; ---- 砖块：遍历存活砖，逐个 FillRectangle ----
+   505 00000566 488D35(3C010000)            lea     rsi, [rel bricks]           ; rsi 非易失，COM 调用后仍有效
+   506 0000056D 31DB                        xor     ebx, ebx
+   507                                  .brick_loop:
+   508 0000056F 83FB20                      cmp     ebx, BRICK_COUNT
+   509 00000572 7374                        jae     .bricks_done
+   510 00000574 833C9E00                    cmp     dword [rsi + rbx*4], 0
+   511 00000578 746A                        je      .brick_next
+   512                                  
+   513 0000057A 89D8                        mov     eax, ebx
+   514 0000057C 83E007                      and     eax, 7
+   515 0000057F 6BC04C                      imul    eax, eax, 76
+   516 00000582 83C012                      add     eax, 18                     ; left
+   517 00000585 F30F2AC0                    cvtsi2ss xmm0, eax
+   518 00000589 F30F1105(FC000000)          movss   [rel draw_rect + D2D1_RECT_F.left], xmm0
+   519 00000591 83C048                      add     eax, 72                     ; right = left + 72
+   520 00000594 F30F2AC0                    cvtsi2ss xmm0, eax
+   521 00000598 F30F1105(04010000)          movss   [rel draw_rect + D2D1_RECT_F.right], xmm0
+   522 000005A0 89D8                        mov     eax, ebx
+   523 000005A2 C1E803                      shr     eax, 3
+   524 000005A5 6BC018                      imul    eax, eax, 24
+   525 000005A8 83C028                      add     eax, 40                     ; top
+   526 000005AB F30F2AC0                    cvtsi2ss xmm0, eax
+   527 000005AF F30F1105(00010000)          movss   [rel draw_rect + D2D1_RECT_F.top], xmm0
+   528 000005B7 83C014                      add     eax, 20                     ; bottom = top + 20
+   529 000005BA F30F2AC0                    cvtsi2ss xmm0, eax
+   530 000005BE F30F1105(08010000)          movss   [rel draw_rect + D2D1_RECT_F.bottom], xmm0
+   531                                  
+   532 000005C6 488B0D(D4000000)            mov     rcx, [rel p_rt]
+   533 000005CD 488D15(FC000000)            lea     rdx, [rel draw_rect]
+   534 000005D4 4C8B05(DC000000)            mov     r8,  [rel p_brick]
+   535                                      COM_CALL rcx, D2D1_RT_FILL_RECTANGLE
+    60 000005DB 488B01              <1>  mov rax, [%1]
+    61 000005DE FF9088000000        <1>  call qword [rax + (%2) * 8]
+   536                                  .brick_next:
+   537 000005E4 FFC3                        inc     ebx
+   538 000005E6 EB87                        jmp     .brick_loop
+   539                                  .bricks_done:
+   540                                  
+   541                                      ; ---- 挡板 ----
+   542 000005E8 F30F1005(2C010000)          movss   xmm0, [rel paddle_x]
+   543 000005F0 F30F1105(FC000000)          movss   [rel draw_rect + D2D1_RECT_F.left], xmm0
+   544 000005F8 F30F5805(EC000000)          addss   xmm0, [rel c_paddle_w]
+   545 00000600 F30F1105(04010000)          movss   [rel draw_rect + D2D1_RECT_F.right], xmm0
+   546 00000608 F30F1005(E8000000)          movss   xmm0, [rel c_paddle_y]
+   547 00000610 F30F1105(00010000)          movss   [rel draw_rect + D2D1_RECT_F.top], xmm0
+   548 00000618 F30F5805(F0000000)          addss   xmm0, [rel c_paddle_h]
+   549 00000620 F30F1105(08010000)          movss   [rel draw_rect + D2D1_RECT_F.bottom], xmm0
+   550 00000628 488B0D(D4000000)            mov     rcx, [rel p_rt]
+   551 0000062F 488D15(FC000000)            lea     rdx, [rel draw_rect]
+   552 00000636 4C8B05(E4000000)            mov     r8,  [rel p_paddle]
+   553                                      COM_CALL rcx, D2D1_RT_FILL_RECTANGLE
+    60 0000063D 488B01              <1>  mov rax, [%1]
+    61 00000640 FF9088000000        <1>  call qword [rax + (%2) * 8]
+   554                                  
+   555                                      ; ---- 球 ----
+   556 00000646 F30F1005(1C010000)          movss   xmm0, [rel ball_x]
+   557 0000064E F30F1105(0C010000)          movss   [rel draw_ellipse + D2D1_ELLIPSE.point_x], xmm0
+   558 00000656 F30F1005(20010000)          movss   xmm0, [rel ball_y]
+   559 0000065E F30F1105(10010000)          movss   [rel draw_ellipse + D2D1_ELLIPSE.point_y], xmm0
+   560 00000666 F30F1005(CC000000)          movss   xmm0, [rel c_ball_r]
+   561 0000066E F30F1105(14010000)          movss   [rel draw_ellipse + D2D1_ELLIPSE.radiusX], xmm0
+   562 00000676 F30F1105(18010000)          movss   [rel draw_ellipse + D2D1_ELLIPSE.radiusY], xmm0
+   563 0000067E 488B0D(D4000000)            mov     rcx, [rel p_rt]
+   564 00000685 488D15(0C010000)            lea     rdx, [rel draw_ellipse]
+   565 0000068C 4C8B05(EC000000)            mov     r8,  [rel p_ball]
+   566                                      COM_CALL rcx, D2D1_RT_FILL_ELLIPSE
+    60 00000693 488B01              <1>  mov rax, [%1]
+    61 00000696 FF90A8000000        <1>  call qword [rax + (%2) * 8]
+   567                                  
+   568                                      ; ---- 命数：左上角 lives 个小圆，圆心 x = 20 + i*24, y = 20 ----
+   569 0000069C 31DB                        xor     ebx, ebx
+   570                                  .life_loop:
+   571 0000069E 3B1D(30010000)              cmp     ebx, dword [rel lives]
+   572 000006A4 735F                        jae     .lives_done
+   573 000006A6 89D8                        mov     eax, ebx
+   574 000006A8 6BC018                      imul    eax, eax, 24
+   575 000006AB 83C014                      add     eax, 20
+   576 000006AE F30F2AC0                    cvtsi2ss xmm0, eax
+   577 000006B2 F30F1105(0C010000)          movss   [rel draw_ellipse + D2D1_ELLIPSE.point_x], xmm0
+   578 000006BA B814000000                  mov     eax, 20
+   579 000006BF F30F2AC0                    cvtsi2ss xmm0, eax
+   580 000006C3 F30F1105(10010000)          movss   [rel draw_ellipse + D2D1_ELLIPSE.point_y], xmm0
+   581 000006CB F30F1005(08010000)          movss   xmm0, [rel c_life_r]
+   582 000006D3 F30F1105(14010000)          movss   [rel draw_ellipse + D2D1_ELLIPSE.radiusX], xmm0
+   583 000006DB F30F1105(18010000)          movss   [rel draw_ellipse + D2D1_ELLIPSE.radiusY], xmm0
+   584 000006E3 488B0D(D4000000)            mov     rcx, [rel p_rt]
+   585 000006EA 488D15(0C010000)            lea     rdx, [rel draw_ellipse]
+   586 000006F1 4C8B05(EC000000)            mov     r8,  [rel p_ball]
+   587                                      COM_CALL rcx, D2D1_RT_FILL_ELLIPSE
+    60 000006F8 488B01              <1>  mov rax, [%1]
+    61 000006FB FF90A8000000        <1>  call qword [rax + (%2) * 8]
+   588 00000701 FFC3                        inc     ebx
+   589 00000703 EB99                        jmp     .life_loop
+   590                                  .lives_done:
+   591                                  
+   592                                      ; EndDraw：HRESULT 经 EAX 返回给调用者（检测 D2DERR_RECREATE_TARGET）
+   593 00000705 488B0D(D4000000)            mov     rcx, [rel p_rt]
+   594 0000070C 31D2                        xor     edx, edx
+   595 0000070E 4531C0                      xor     r8d, r8d
+   596                                      COM_CALL rcx, D2D1_RT_END_DRAW
+    60 00000711 488B01              <1>  mov rax, [%1]
+    61 00000714 FF9088010000        <1>  call qword [rax + (%2) * 8]
+   597                                  
+   598 0000071A 4883C430                    add     rsp, 48
+   599 0000071E 5E                          pop     rsi
+   600 0000071F 5B                          pop     rbx
+   601 00000720 5D                          pop     rbp
+   602 00000721 C3                          ret
+   603                                  
+   604                                  ; ------------------------------------------------------------
+   605                                  ; WndProc
+   606                                  ; ------------------------------------------------------------
+   607                                  WndProc:
+   608 00000722 55                          push    rbp
+   609 00000723 4889E5                      mov     rbp, rsp
+   610 00000726 4883EC20                    sub     rsp, FRAME_SUB_RSP
+   611                                  
+   612 0000072A 83FA0F                      cmp     edx, WM_PAINT
+   613 0000072D 0F84DC000000                je      .on_paint
+   614 00000733 83FA05                      cmp     edx, WM_SIZE
+   615 00000736 7446                        je      .on_size
+   616 00000738 81FA13010000                cmp     edx, WM_TIMER
+   617 0000073E 0F84AE000000                je      .on_timer
+   618 00000744 81FA00010000                cmp     edx, WM_KEYDOWN
+   619 0000074A 0F84E9000000                je      .on_keydown
+   620 00000750 81FA01010000                cmp     edx, WM_KEYUP
+   621 00000756 0F8417010000                je      .on_keyup
+   622 0000075C 83FA10                      cmp     edx, WM_CLOSE
+   623 0000075F 0F8432010000                je      .on_close
+   624 00000765 83FA02                      cmp     edx, WM_DESTROY
+   625 00000768 0F8439010000                je      .on_destroy
+   626 0000076E 83FA14                      cmp     edx, WM_ERASEBKGND
+   627 00000771 0F846E010000                je      .on_erase
+   628                                  
+   629 00000777 E8(00000000)                call    DefWindowProcW
+   630 0000077C C9                          leave
+   631 0000077D C3                          ret
+   632                                  
+   633                                  ; ---- WM_SIZE：记录尺寸并把渲染目标 Resize（与第 19 章相同） ----
+   634                                  .on_size:
+   635 0000077E 4489C8                      mov     eax, r9d
+   636 00000781 0FB7C8                      movzx   ecx, ax
+   637 00000784 890D(F4000000)              mov     [rel g_width], ecx
+   638 0000078A C1E810                      shr     eax, 16
+   639 0000078D 0FB7C8                      movzx   ecx, ax
+   640 00000790 890D(F8000000)              mov     [rel g_height], ecx
+   641                                  
+   642 00000796 488B05(D4000000)            mov     rax, [rel p_rt]
+   643 0000079D 4885C0                      test    rax, rax
+   644 000007A0 7438                        jz      .size_done
+   645                                  
+   646 000007A2 488D05(C4000000)            lea     rax, [rel size_u]
+   647 000007A9 8B0D(F4000000)              mov     ecx, [rel g_width]
+   648 000007AF 8908                        mov     [rax + D2D1_SIZE_U.width], ecx
+   649 000007B1 8B0D(F8000000)              mov     ecx, [rel g_height]
+   650 000007B7 894804                      mov     [rax + D2D1_SIZE_U.height], ecx
+   651                                  
+   652 000007BA 488B0D(D4000000)            mov     rcx, [rel p_rt]
+   653 000007C1 488D15(C4000000)            lea     rdx, [rel size_u]
+   654                                      COM_CALL rcx, D2D1_HWND_RT_RESIZE
+    60 000007C8 488B01              <1>  mov rax, [%1]
+    61 000007CB FF90D0010000        <1>  call qword [rax + (%2) * 8]
+   655 000007D1 85C0                        test    eax, eax
+   656 000007D3 7405                        jz      .size_done
+   657 000007D5 E8AEF8FFFF                  call    release_scene               ; Resize 失败：下一帧重建
+   658                                  
+   659                                  .size_done:
+   660 000007DA 488B0D(80000000)            mov     rcx, [rel hwnd]
+   661 000007E1 31D2                        xor     edx, edx
+   662 000007E3 41B800000000                mov     r8d, FALSE
+   663 000007E9 E8(00000000)                call    InvalidateRect
+   664 000007EE 31C0                        xor     eax, eax
+   665 000007F0 C9                          leave
+   666 000007F1 C3                          ret
+   667                                  
+   668                                  ; ---- WM_TIMER：游戏循环的心跳 ----
+   669                                  .on_timer:
+   670 000007F2 E814FAFFFF                  call    update_game
+   671 000007F7 488B0D(80000000)            mov     rcx, [rel hwnd]
+   672 000007FE 31D2                        xor     edx, edx
+   673 00000800 41B800000000                mov     r8d, FALSE
+   674 00000806 E8(00000000)                call    InvalidateRect
+   675 0000080B 31C0                        xor     eax, eax
+   676 0000080D C9                          leave
+   677 0000080E C3                          ret
+   678                                  
+   679                                  ; ---- WM_PAINT ----
+   680                                  .on_paint:
+   681 0000080F 488B05(D4000000)            mov     rax, [rel p_rt]
+   682 00000816 4885C0                      test    rax, rax
+   683 00000819 7509                        jnz     .have_rt
+   684 0000081B E8E6F8FFFF                  call    create_render_target
+   685 00000820 85C0                        test    eax, eax
+   686 00000822 7511                        jnz     .paint_done
+   687                                  .have_rt:
+   688 00000824 E80CFDFFFF                  call    draw_scene
+   689 00000829 3D0C009988                  cmp     eax, D2DERR_RECREATE_TARGET
+   690 0000082E 7505                        jne     .paint_done
+   691 00000830 E853F8FFFF                  call    release_scene               ; 设备丢失：下一帧重建
+   692                                  .paint_done:
+   693 00000835 31C0                        xor     eax, eax
+   694 00000837 C9                          leave
+   695 00000838 C3                          ret
+   696                                  
+   697                                  ; ---- WM_KEYDOWN：←/→ 置位，ESC 退出 ----
+   698                                  .on_keydown:
+   699 00000839 4183F825                    cmp     r8d, VK_LEFT
+   700 0000083D 741A                        je      .kd_left
+   701 0000083F 4183F827                    cmp     r8d, VK_RIGHT
+   702 00000843 7420                        je      .kd_right
+   703 00000845 4183F81B                    cmp     r8d, VK_ESCAPE
+   704 00000849 7524                        jne     .kd_done
+   705 0000084B 488B0D(80000000)            mov     rcx, [rel hwnd]
+   706 00000852 E8(00000000)                call    DestroyWindow
+   707 00000857 EB16                        jmp     .kd_done
+   708                                  .kd_left:
+   709 00000859 C705(34010000)0100-         mov     dword [rel key_left], 1
+   709 00000861 0000               
+   710 00000863 EB0A                        jmp     .kd_done
+   711                                  .kd_right:
+   712 00000865 C705(38010000)0100-         mov     dword [rel key_right], 1
+   712 0000086D 0000               
+   713                                  .kd_done:
+   714 0000086F 31C0                        xor     eax, eax
+   715 00000871 C9                          leave
+   716 00000872 C3                          ret
+   717                                  
+   718                                  ; ---- WM_KEYUP：松开即停 ----
+   719                                  .on_keyup:
+   720 00000873 4183F825                    cmp     r8d, VK_LEFT
+   721 00000877 750A                        jne     .ku_not_left
+   722 00000879 C705(34010000)0000-         mov     dword [rel key_left], 0
+   722 00000881 0000               
+   723                                  .ku_not_left:
+   724 00000883 4183F827                    cmp     r8d, VK_RIGHT
+   725 00000887 750A                        jne     .ku_done
+   726 00000889 C705(38010000)0000-         mov     dword [rel key_right], 0
+   726 00000891 0000               
+   727                                  .ku_done:
+   728 00000893 31C0                        xor     eax, eax
+   729 00000895 C9                          leave
+   730 00000896 C3                          ret
+   731                                  
+   732                                  .on_close:
+   733 00000897 488B0D(80000000)            mov     rcx, [rel hwnd]
+   734 0000089E E8(00000000)                call    DestroyWindow
+   735 000008A3 31C0                        xor     eax, eax
+   736 000008A5 C9                          leave
+   737 000008A6 C3                          ret
+   738                                  
+   739                                  .on_destroy:
+   740 000008A7 488B0D(80000000)            mov     rcx, [rel hwnd]
+   741 000008AE BA01000000                  mov     edx, 1
+   742 000008B3 E8(00000000)                call    KillTimer
+   743 000008B8 E8CBF7FFFF                  call    release_scene
+   744                                  
+   745 000008BD 488B0D(CC000000)            mov     rcx, [rel p_factory]
+   746 000008C4 4885C9                      test    rcx, rcx
+   747 000008C7 7411                        jz      .no_factory
+   748                                      COM_CALL rcx, IUNKNOWN_RELEASE
+    60 000008C9 488B01              <1>  mov rax, [%1]
+    61 000008CC FF5010              <1>  call qword [rax + (%2) * 8]
+   749 000008CF 48C705(CC000000)00-         mov     qword [rel p_factory], 0
+   749 000008D7 000000             
+   750                                  .no_factory:
+   751 000008DA 31C9                        xor     ecx, ecx
+   752 000008DC E8(00000000)                call    PostQuitMessage
+   753 000008E1 31C0                        xor     eax, eax
+   754 000008E3 C9                          leave
+   755 000008E4 C3                          ret
+   756                                  
+   757                                  .on_erase:
+   758 000008E5 B801000000                  mov     eax, 1                      ; 背景由 D2D Clear 负责
+   759 000008EA C9                          leave
+   760 000008EB C3                          ret
+   761                                  
+   762                                  ; ------------------------------------------------------------
+   763                                  ; _start：RSP%16==8 → sub rsp,104 后 ==0
+   764                                  ; （32 影子 + CreateWindowExW 的 64 栈参 + 8 对齐，推导见第 22 章）
+   765                                  ; ------------------------------------------------------------
+   766                                  _start:
+   767 000008EC 4883EC68                    sub     rsp, 104
+   768                                  
+   769 000008F0 31C9                        xor     ecx, ecx
+   770 000008F2 E8(00000000)                call    GetModuleHandleW
+   771 000008F7 488905(88000000)            mov     [rel hinst], rax
+   772                                  
+   773 000008FE C705(F4000000)8002-         mov     dword [rel g_width], 640
+   773 00000906 0000               
+   774 00000908 C705(F8000000)E001-         mov     dword [rel g_height], 480
+   774 00000910 0000               
+   775                                  
+   776 00000912 488D3D(00000000)            lea     rdi, [rel wndclass]
+   777 00000919 31C0                        xor     eax, eax
+   778 0000091B B914000000                  mov     ecx, WNDCLASSEXW_size / 4
+   779 00000920 F3AB                        rep     stosd
+   780                                  
+   781 00000922 488D05(00000000)            lea     rax, [rel wndclass]
+   782 00000929 C70050000000                mov     dword [rax + WNDCLASSEXW.cbSize], WNDCLASSEXW_size
+   783 0000092F C7400403000000              mov     dword [rax + WNDCLASSEXW.style], CS_HREDRAW | CS_VREDRAW
+   784 00000936 488D0DE5FDFFFF              lea     rcx, [rel WndProc]
+   785 0000093D 48894808                    mov     [rax + WNDCLASSEXW.lpfnWndProc], rcx
+   786 00000941 488B0D(88000000)            mov     rcx, [rel hinst]
+   787 00000948 48894818                    mov     [rax + WNDCLASSEXW.hInstance], rcx
+   788 0000094C 48C7403000000000            mov     qword [rax + WNDCLASSEXW.hbrBackground], 0
+   789 00000954 488D0D(00000000)            lea     rcx, [rel class_name]
+   790 0000095B 48894840                    mov     [rax + WNDCLASSEXW.lpszClassName], rcx
+   791                                  
+   792 0000095F 31C9                        xor     ecx, ecx
+   793 00000961 BA007F0000                  mov     edx, IDI_APPLICATION
+   794 00000966 E8(00000000)                call    LoadIconW
+   795 0000096B 488D0D(00000000)            lea     rcx, [rel wndclass]
+   796 00000972 48894120                    mov     [rcx + WNDCLASSEXW.hIcon], rax
+   797 00000976 48894148                    mov     [rcx + WNDCLASSEXW.hIconSm], rax
+   798                                  
+   799 0000097A 31C9                        xor     ecx, ecx
+   800 0000097C BA007F0000                  mov     edx, IDC_ARROW
+   801 00000981 E8(00000000)                call    LoadCursorW
+   802 00000986 488D0D(00000000)            lea     rcx, [rel wndclass]
+   803 0000098D 48894128                    mov     [rcx + WNDCLASSEXW.hCursor], rax
+   804                                  
+   805 00000991 488D0D(00000000)            lea     rcx, [rel wndclass]
+   806 00000998 E8(00000000)                call    RegisterClassExW
+   807 0000099D 85C0                        test    eax, eax
+   808 0000099F 0F8417010000                jz      .fail_register
+   809                                  
+   810                                      ; ---- CreateWindowExW：12 参，后 8 走栈 ----
+   811 000009A5 31C9                        xor     ecx, ecx
+   812 000009A7 488D15(00000000)            lea     rdx, [rel class_name]
+   813 000009AE 4C8D05(2A000000)            lea     r8,  [rel window_title]
+   814 000009B5 41B90000CF00                mov     r9d, WS_OVERLAPPEDWINDOW
+   815 000009BB B800000080                  mov     eax, CW_USEDEFAULT
+   816 000009C0 4889442420                  mov     qword [rsp + 32], rax
+   817 000009C5 4889442428                  mov     qword [rsp + 40], rax
+   818 000009CA 48C744243080020000          mov     qword [rsp + 48], 640
+   819 000009D3 48C7442438E0010000          mov     qword [rsp + 56], 480
+   820 000009DC 48C744244000000000          mov     qword [rsp + 64], 0
+   821 000009E5 48C744244800000000          mov     qword [rsp + 72], 0
+   822 000009EE 488B05(88000000)            mov     rax, [rel hinst]
+   823 000009F5 4889442450                  mov     qword [rsp + 80], rax
+   824 000009FA 48C744245800000000          mov     qword [rsp + 88], 0
+   825 00000A03 E8(00000000)                call    CreateWindowExW
+   826 00000A08 4885C0                      test    rax, rax
+   827 00000A0B 0F84B5000000                jz      .fail_create
+   828 00000A11 488905(80000000)            mov     [rel hwnd], rax
+   829                                  
+   830                                      ; ---- D2D 工厂 ----
+   831 00000A18 31C9                        xor     ecx, ecx                    ; D2D1_FACTORY_TYPE_SINGLE_THREADED
+   832 00000A1A 488D15(74000000)            lea     rdx, [rel iid_d2d1factory]
+   833 00000A21 4531C0                      xor     r8d, r8d                    ; pFactoryOptions = NULL
+   834 00000A24 4C8D0D(CC000000)            lea     r9,  [rel p_factory]
+   835 00000A2B E8(00000000)                call    D2D1CreateFactory
+   836 00000A30 85C0                        test    eax, eax
+   837 00000A32 0F8598000000                jnz     .fail_d2d
+   838                                  
+   839 00000A38 E8C9F6FFFF                  call    create_render_target
+   840 00000A3D 85C0                        test    eax, eax
+   841 00000A3F 0F858B000000                jnz     .fail_d2d
+   842                                  
+   843                                      ; ---- 初始化游戏状态 ----
+   844 00000A45 E810F6FFFF                  call    reset_game
+   845                                  
+   846                                      ; ---- SetTimer(hwnd, 1, 16ms, NULL)：约 60 帧/秒 ----
+   847 00000A4A 488B0D(80000000)            mov     rcx, [rel hwnd]
+   848 00000A51 BA01000000                  mov     edx, 1
+   849 00000A56 41B810000000                mov     r8d, 16
+   850 00000A5C 4531C9                      xor     r9d, r9d
+   851 00000A5F E8(00000000)                call    SetTimer
+   852                                  
+   853 00000A64 488B0D(80000000)            mov     rcx, [rel hwnd]
+   854 00000A6B BA01000000                  mov     edx, SW_SHOWNORMAL
+   855 00000A70 E8(00000000)                call    ShowWindow
+   856                                  
+   857 00000A75 488B0D(80000000)            mov     rcx, [rel hwnd]
+   858 00000A7C E8(00000000)                call    UpdateWindow
+   859                                  
+   860                                  .msg_loop:
+   861 00000A81 488D0D(50000000)            lea     rcx, [rel msg]
+   862 00000A88 31D2                        xor     edx, edx
+   863 00000A8A 4531C0                      xor     r8d, r8d
+   864 00000A8D 4531C9                      xor     r9d, r9d
+   865 00000A90 E8(00000000)                call    GetMessageW
+   866 00000A95 85C0                        test    eax, eax
+   867 00000A97 741C                        jz      .done
+   868 00000A99 781A                        js      .done
+   869                                  
+   870 00000A9B 488D0D(50000000)            lea     rcx, [rel msg]
+   871 00000AA2 E8(00000000)                call    TranslateMessage
+   872                                  
+   873 00000AA7 488D0D(50000000)            lea     rcx, [rel msg]
+   874 00000AAE E8(00000000)                call    DispatchMessageW
+   875 00000AB3 EBCC                        jmp     .msg_loop
+   876                                  
+   877                                  .done:
+   878 00000AB5 31C9                        xor     ecx, ecx                    ; ExitProcess(0)
+   879 00000AB7 E8(00000000)                call    ExitProcess
+   880                                  
+   881                                  .fail_register:
+   882 00000ABC B901000000                  mov     ecx, 1
+   883 00000AC1 E8(00000000)                call    ExitProcess
+   884                                  
+   885                                  .fail_create:
+   886 00000AC6 B902000000                  mov     ecx, 2
+   887 00000ACB E8(00000000)                call    ExitProcess
+   888                                  
+   889                                  .fail_d2d:
+   890 00000AD0 B903000000                  mov     ecx, 3
+   891 00000AD5 E8(00000000)                call    ExitProcess

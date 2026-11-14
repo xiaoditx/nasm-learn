@@ -1,0 +1,126 @@
+     1                                  ; ============================================================
+     2                                  ; 第 06 章：wmain + 宽字符 CRT + 第一套 Makefile
+     3                                  ; 构建：make          （nasm -f win64 -l hello_wmain.obj.lst -o ...）
+     4                                  ; 运行：.\hello_wmain.exe alpha beta
+     5                                  ; ============================================================
+     6                                  default rel
+     7                                  %include "../common.asm"
+     1                              <1> ; ============================================================
+     2                              <1> ; common.asm —— 全项目共享定义
+     3                              <1> ; 只包含预处理指令、常量与宏，不产生任何段/数据。
+     4                              <1> ; 用法：在章节目录中写  %include "../common.asm"
+     5                              <1> ; ============================================================
+     6                              <1> 
+     7                              <1> ; ---------- Windows x64 栈约定 ----------
+     8                              <1> %define SHADOW_SPACE          32      ; 调用前必须预留的影子空间
+     9                              <1> %define ENTRY_SUB_RSP         40      ; 入口 RSP%16==8 → 减 40 后 %16==0
+    10                              <1> %define FRAME_SUB_RSP         32      ; push rbp 之后 %16==0 → 再减 32
+    11                              <1> 
+    12                              <1> ; ---------- 通用常量 ----------
+    13                              <1> %define NULL                  0
+    14                              <1> %define TRUE                  1
+    15                              <1> %define FALSE                 0
+    16                              <1> %define WCHAR_SIZE            2       ; UTF-16 码元大小
+    17                              <1> %define MAX_PATH_W            260
+    18                              <1> 
+    19                              <1> ; ---------- 标准设备 ----------
+    20                              <1> %define STD_OUTPUT_HANDLE     -11
+    21                              <1> %define STD_ERROR_HANDLE      -12
+    22                              <1> 
+    23                              <1> ; ---------- 文件 ----------
+    24                              <1> %define INVALID_HANDLE_VALUE  -1
+    25                              <1> %define GENERIC_READ          0x80000000
+    26                              <1> %define GENERIC_WRITE         0x40000000
+    27                              <1> %define CREATE_ALWAYS         2
+    28                              <1> %define OPEN_EXISTING         3
+    29                              <1> %define FILE_ATTRIBUTE_NORMAL 0x80
+    30                              <1> 
+    31                              <1> ; ---------- 错误码 ----------
+    32                              <1> %define ERROR_FILE_NOT_FOUND  2
+    33                              <1> %define ERROR_PATH_NOT_FOUND  3
+    34                              <1> %define ERROR_ACCESS_DENIED   5
+    35                              <1> 
+    36                              <1> ; ---------- 代码页 ----------
+    37                              <1> %define CP_UTF8               65001
+    38                              <1> 
+    39                              <1> ; ---------- 堆 ----------
+    40                              <1> %define HEAP_ZERO_MEMORY      8
+    41                              <1> 
+    42                              <1> ; ---------- 宽字符串宏（UTF-16LE） ----------
+    43                              <1> ; WSTR  ：展开为 UTF-16LE 码元，不带结尾 0
+    44                              <1> ; WSTRZ ：展开为 UTF-16LE 码元，并追加一个 0 结尾
+    45                              <1> %macro WSTR 1
+    46                              <1>     dw __utf16__(%1)
+    47                              <1> %endmacro
+    48                              <1> 
+    49                              <1> %macro WSTRZ 1
+    50                              <1>     dw __utf16__(%1), 0
+    51                              <1> %endmacro
+    52                              <1> 
+    53                              <1> ; ---------- 第 12 章：文本统计结构（多个 .asm 共用） ----------
+    54                              <1> struc TEXT_STATS
+    55 00000000 ????????            <1>     .chars: resd 1
+    56 00000004 ????????            <1>     .lines: resd 1
+    57 00000008 ????????            <1>     .words: resd 1
+    58                              <1> endstruc
+     8                                  
+     9                                  section .rdata
+    10                                      msg_args:   WSTR "wmain received %d argument(s)"
+    10                              <1>  msg_args: 
+    46 00000000 77006D00610069006E- <1>  dw __utf16__(%1)
+    46 00000009 002000720065006300- <1>
+    46 00000012 650069007600650064- <1>
+    46 0000001B 002000250064002000- <1>
+    46 00000024 61007200670075006D- <1>
+    46 0000002D 0065006E0074002800- <1>
+    46 00000036 73002900            <1>
+    11 0000003A 0A000000                                dw 10, 0
+    12                                      msg_hello:  WSTR "hello from wmain"
+    12                              <1>  msg_hello: 
+    46 0000003E 680065006C006C006F- <1>  dw __utf16__(%1)
+    46 00000047 002000660072006F00- <1>
+    46 00000050 6D00200077006D0061- <1>
+    46 00000059 0069006E00          <1>
+    13 0000005E 0A000000                                dw 10, 0
+    14                                      msg_tail:   WSTR "built with nasm + gcc, wide API by default"
+    14                              <1>  msg_tail: 
+    46 00000062 6200750069006C0074- <1>  dw __utf16__(%1)
+    46 0000006B 002000770069007400- <1>
+    46 00000074 680020006E00610073- <1>
+    46 0000007D 006D0020002B002000- <1>
+    46 00000086 6700630063002C0020- <1>
+    46 0000008F 007700690064006500- <1>
+    46 00000098 200041005000490020- <1>
+    46 000000A1 006200790020006400- <1>
+    46 000000AA 65006600610075006C- <1>
+    46 000000B3 007400              <1>
+    15 000000B6 0A000000                                dw 10, 0
+    16                                  
+    17                                  section .text
+    18                                      global  wmain
+    19                                      extern  wprintf
+    20                                  
+    21                                  ; int wmain(int argc, wchar_t **argv)
+    22                                  ;   ECX = argc, RDX = argv
+    23                                  wmain:
+    24 00000000 55                          push    rbp
+    25 00000001 4889E5                      mov     rbp, rsp
+    26 00000004 4883EC20                    sub     rsp, FRAME_SUB_RSP      ; 32 字节影子空间
+    27                                  
+    28                                      ; 先打印 argc：此时 ECX 还是原值，没有经过任何 call
+    29 00000008 89CA                        mov     edx, ecx
+    30 0000000A 488D0D(00000000)            lea     rcx, [rel msg_args]
+    31 00000011 31C0                        xor     eax, eax                ; 变参函数要求 AL = 0（无浮点参数）
+    32 00000013 E8(00000000)                call    wprintf
+    33                                  
+    34 00000018 488D0D(3E000000)            lea     rcx, [rel msg_hello]
+    35 0000001F 31C0                        xor     eax, eax
+    36 00000021 E8(00000000)                call    wprintf
+    37                                  
+    38 00000026 488D0D(62000000)            lea     rcx, [rel msg_tail]
+    39 0000002D 31C0                        xor     eax, eax
+    40 0000002F E8(00000000)                call    wprintf
+    41                                  
+    42 00000034 31C0                        xor     eax, eax                ; wmain 的返回值就是进程退出码
+    43 00000036 C9                          leave
+    44 00000037 C3                          ret

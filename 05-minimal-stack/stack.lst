@@ -1,0 +1,64 @@
+     1                                  ; ============================================================
+     2                                  ; 第 05 章：栈、栈帧与 call/ret
+     3                                  ;
+     4                                  ; 用递归阶乘演示：
+     5                                  ;   - 每次 call 把返回地址压栈，RSP 减 8
+     6                                  ;   - 标准栈帧 push rbp / mov rbp,rsp / sub rsp,32
+     7                                  ;   - ret 从栈顶弹出返回地址
+     8                                  ;
+     9                                  ; 构建（在本目录下执行）：
+    10                                  ;   nasm -f win64 -l stack.lst -o stack.obj stack.asm
+    11                                  ;   ld -o stack.exe stack.obj -L "C:/msys64/ucrt64/lib" -lkernel32 --subsystem console --entry=_start
+    12                                  ;
+    13                                  ; 运行后退出码应为 120（5! = 120）：
+    14                                  ;   .\stack.exe
+    15                                  ;   $LASTEXITCODE
+    16                                  ; ============================================================
+    17                                  
+    18                                  default rel
+    19                                  
+    20                                  section .text
+    21                                      global _start
+    22                                      extern ExitProcess
+    23                                  
+    24                                  _start:
+    25 00000000 4883EC28                    sub rsp, 40                     ; 入口 RSP%16==8 → 40 后 %16==0
+    26                                  
+    27 00000004 B905000000                  mov ecx, 5                      ; fact(5)
+    28 00000009 E807000000                  call fact
+    29                                      ; 此时 RAX = 120
+    30                                  
+    31 0000000E 89C1                        mov ecx, eax
+    32 00000010 E8(00000000)                call ExitProcess                ; 退出码 120
+    33                                  
+    34                                  ; ------------------------------------------------------------
+    35                                  ; fact：n!（n 在 ECX 中，结果在 EAX 中）
+    36                                  ;
+    37                                  ; 入口：RSP % 16 == 8（call 压入 8 字节返回地址）
+    38                                  ; 序言：push rbp      → RSP % 16 == 0
+    39                                  ;       mov rbp, rsp
+    40                                  ;       sub rsp, 32   → 影子空间 + 本地槽，仍 % 16 == 0
+    41                                  ; 这样函数体内再 call 时，call 指令执行处 RSP % 16 == 0，符合 ABI。
+    42                                  ; ------------------------------------------------------------
+    43                                  fact:
+    44 00000015 55                          push rbp
+    45 00000016 4889E5                      mov rbp, rsp
+    46 00000019 4883EC20                    sub rsp, 32
+    47                                  
+    48 0000001D 894DFC                      mov [rbp - 4], ecx              ; 本地槽保存 n（递归调用会覆盖 ECX）
+    49                                  
+    50 00000020 83F901                      cmp ecx, 1
+    51 00000023 7E10                        jle .base
+    52                                  
+    53 00000025 8D49FF                      lea ecx, [rcx - 1]              ; n - 1
+    54 00000028 E8E8FFFFFF                  call fact                       ; 递归
+    55 0000002D 8B4DFC                      mov ecx, [rbp - 4]              ; 恢复 n
+    56 00000030 0FAFC1                      imul eax, ecx                   ; (n-1)! * n
+    57 00000033 EB05                        jmp .done
+    58                                  
+    59                                  .base:
+    60 00000035 B801000000                  mov eax, 1
+    61                                  
+    62                                  .done:
+    63 0000003A C9                          leave                           ; mov rsp, rbp; pop rbp
+    64 0000003B C3                          ret                             ; 弹出返回地址，回到调用点

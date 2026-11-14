@@ -1,0 +1,210 @@
+# 第 03 章：常用指令、循环与自检
+
+> 阶段零（00~05）不配 Makefile。
+> 本章源码：[instructions.asm](instructions.asm)
+> 本章清单：[instructions.lst](instructions.lst)
+
+## 1. 本章目标
+
+本章把"单条指令"升级为"能干活的小程序"：
+
+- 算术：`add / sub / imul / div`
+- 逻辑：`and / or / xor / test`
+- 比较与跳转：`cmp / jmp / jcc`
+- 循环：手工维护下标与计数器
+- 函数：`call / ret`、参数寄存器、返回值
+- 用退出码表达自检结果：`0 = 全部通过`
+
+本章不再逐条打印结果，而是让程序自己检查 6 项，失败就置对应位。退出码为 0 才代表全部正确。
+
+## 2. 知识点讲解
+
+### 2.1 算术指令
+
+| 指令 | 作用 | 注意 |
+|---|---|---|
+| `add dst, src` | dst += src | 影响 OF/SF/ZF/CF |
+| `sub dst, src` | dst -= src | `cmp` 就是不存结果的 `sub` |
+| `imul` | 有符号乘法 | 见下 |
+| `div` | 无符号除法 | 隐含 `RDX:RAX`，见下 |
+
+**`div` 的隐含操作数**是 x64 汇编最容易踩的坑之一：
+
+```text
+div ecx   →   EDX:EAX / ECX，商 → EAX，余数 → EDX
+div rcx   →   RDX:RAX / RCX，商 → RAX，余数 → RDX
+```
+
+所以除法前**必须**把 `EDX`（32 位除）或 `RDX`（64 位除）清零，否则高位会污染被除数，得到错误商甚至触发 `#DE`（除零/溢出）异常。
+
+**`imul` 的三种形式**：
+
+```asm
+imul eax, ecx          ; eax = eax * ecx          （二操作数）
+imul eax, ecx, 6       ; eax = ecx * 6            （三操作数，不碰 EDX）
+imul rcx               ; RDX:RAX = RAX * RCX      （单操作数，结果更宽）
+```
+
+日常用三操作数形式最省心，不碰 `RDX`，也不会和 `div` 的约定纠缠。
+
+### 2.2 逻辑与测试
+
+`and / or / xor` 是按位运算，会修改目的操作数。`test` 等价于"不保存结果的 `and`"，只改标志位。常见用法：
+
+```asm
+test eax, 1     ; 检查最低位（奇偶）。ZF=1 表示偶数
+test eax, eax   ; 检查是否为 0。ZF=1 表示为 0（比 cmp eax, 0 更短）
+```
+
+### 2.3 比较与条件跳转
+
+`cmp a, b` 做 `a - b` 但不保存结果，只改标志位。后续 `jcc` 依据标志位跳转：
+
+| 指令 | 含义 | 标志依据 |
+|---|---|---|
+| `je` / `jz` | 相等 / 为零 | ZF=1 |
+| `jne` / `jnz` | 不等 / 非零 | ZF=0 |
+| `jb` | 小于（无符号） | CF=1 |
+| `ja` | 大于（无符号） | CF=0 且 ZF=0 |
+| `jl` | 小于（有符号） | SF≠OF |
+| `jg` | 大于（有符号） | ZF=0 且 SF=OF |
+
+**无符号 vs 有符号跳转**：数组下标、长度、计数器通常是非负数，用 `jb/ja`；有符号数比较用 `jl/jg`。本章循环计数用 `jb`。
+
+### 2.4 循环的标准写法
+
+x64 没有高效的"自动循环"指令（`loop` 存在但慢），标准写法是手工维护计数器：
+
+```text
+初始化计数器 i=0，总和=0
+.loop:
+    sum += arr[i]
+    i++
+    if i < len: goto .loop
+```
+
+寻址 `[base + index*scale]`：`[rsi + rdx*8]` 表示"基址 rsi + 索引 rdx * 8"，scale 只能是 1/2/4/8。
+
+### 2.5 `call` / `ret` 与栈帧
+
+`call label` 做两件事：把返回地址压栈，然后跳到 `label`。`ret` 从栈顶弹出返回地址并跳回去。
+
+被调用函数的标准序言/尾声：
+
+```asm
+sum_qwords:
+    push rbp            ; 保存旧帧指针
+    mov  rbp, rsp       ; 建立新帧指针
+    sub  rsp, 32        ; 32 字节影子空间（也是 16 的倍数）
+    ...
+    leave               ; = mov rsp, rbp + pop rbp
+    ret
+```
+
+**对齐推导**（与第 00 章入口对齐同理）：
+- 调用者 `call` 时 `RSP%16==0` → 压入返回地址后，被调方入口 `RSP%16==8`。
+- `push rbp` 减 8 → `RSP%16==0`。
+- `sub rsp, 32` 仍是 16 的倍数 → 保持 `RSP%16==0`。
+
+这样被调方内部再 `call` 其他函数时仍然对齐。
+
+## 3. 实践用例
+
+打开 [instructions.asm](instructions.asm)。程序做 6 项自检，**通过则跳过置位，失败才置位**，所以全过时退出码为 0：
+
+| 位 | 值 | 检查 |
+|---|---|---|
+| bit 0 | 1 | 循环求和 1..10 = 55 |
+| bit 1 | 2 | 字符串 `"hello"` 长度为 5 |
+| bit 2 | 4 | `imul`：7 * 6 = 42 |
+| bit 3 | 8 | `div`：42 / 6 商 7 余 0 |
+| bit 4 | 16 | `test` 判 42 为偶数 |
+| bit 5 | 32 | `call/ret` 调用本地求和函数 |
+
+### 3.1 构建与运行
+
+```powershell
+nasm -f win64 -l instructions.lst -o instructions.obj instructions.asm
+ld -o instructions.exe instructions.obj -L "C:/msys64/ucrt64/lib" -lkernel32 --subsystem console --entry=_start
+.\instructions.exe
+$LASTEXITCODE
+```
+
+实测结果：
+
+```text
+PS> .\instructions.exe
+PS> $LASTEXITCODE
+0
+```
+
+`0` 表示 6 项全部通过。故意改坏一项（比如把 `cmp rax, 55` 改成 `cmp rax, 56`），退出码就会变成 `1`。
+
+### 3.2 `.lst` 摘录
+
+```text
+    35 00000017 480304D6                    add rax, [rsi + rdx*8]
+    36 0000001B 48FFC2                      inc rdx
+    37 0000001E 4839CA                      cmp rdx, rcx
+    38 00000021 72F4                        jb .sum_loop
+    39 00000023 4883F837                    cmp rax, 55
+    48 00000036 803C0600                    cmp byte [rsi + rax], 0
+    60 0000004E 6BC006                      imul eax, eax, 6
+    70 00000066 F7F1                        div ecx
+    81 0000007B A901000000                  test eax, 1
+    89 00000092 E812000000                  call sum_qwords
+   106 000000A9 55                          push rbp
+   108 000000AD 4883EC20                    sub rsp, 32
+   118 000000C2 C9                          leave
+   119 000000C3 C3                          ret
+```
+
+- `480304D6`：`add rax, [rsi + rdx*8]`，`D6` 是 SIB 字节，编码 base=rsi, index=rdx, scale=8。
+- `72F4`：`jb` 的短跳转，位移 `F4` = -12，跳回循环开头。
+- `6BC006`：`imul eax, eax, 6` 三操作数形式。
+- `F7F1`：`div ecx`。
+- `E812000000`：`call` 用 32 位相对位移。
+- `C9` / `C3`：`leave` / `ret`，各 1 字节。
+
+### 3.3 GDB 验证
+
+断在循环第一条指令，单步一次：
+
+```text
+rax            0x0    ← 循环前
+rdx            0x0
+rax            0x1    ← 执行 add 后，arr[0]=1 被加进来
+rdx            0x0    ← inc 还没执行
+```
+
+## 4. 代码重点讲解
+
+1. **循环求和（知识点 2.4）**：`[rsi + rdx*8]` 是基址+变址寻址，`rdx` 当下标。`jb` 用于无符号比较。循环 10 次累加 `1+2+...+10=55`。
+2. **字符串长度（知识点 2.3）**：`cmp byte [rsi + rax], 0` 逐字节找 NUL。`byte` 必须显式写，否则 NASM 不知道比较宽度。
+3. **除法前清 EDX（知识点 2.1）**：`xor edx, edx` 是 `div ecx` 前的必修课。漏掉的话 `EDX:EAX` 变成巨大数，商可能溢出。
+4. **`test eax, 1`（知识点 2.2）**：检查奇偶。42 的最低位是 0，`test` 后 ZF=1，`je` 跳转通过。
+5. **本地函数栈帧（知识点 2.5）**：`sum_qwords` 的序言 `push rbp; sub rsp, 32` 保证入口 `RSP%16==8` 经 `push`→0、`sub 32`→0。`leave` 等于 `mov rsp,rbp; pop rbp`。
+6. **自检逻辑方向**：通过就 `je` 跳过 `or r15d, bit`，失败才置位。写 `cmp`+`jcc` 后一定要用小例子验证分支方向。
+
+## 5. 常见坑
+
+1. **`div` 前忘记清 `RDX`/`EDX`**：`RDX:RAX` 才是被除数；高位脏数据导致错误商甚至 `#DE` 异常。
+2. **有符号除法用 `div`**：负数要用 `idiv`，并对 `RDX` 做符号扩展（`cqo`/`cdq`）。
+3. **`jb`/`jl` 混用**：`jb` 无符号，`jl` 有符号。数组下标通常无符号。
+4. **自检逻辑写反**：通过置位会导致全过却返回非零。
+5. **`cmp byte [...]` 漏写 `byte`**：NASM 无法推断内存操作数宽度。
+6. **`call` 前栈未对齐**：调用者必须保证 `call` 点 `RSP%16==0`。
+7. **把 `lea` 当成读内存**：`lea` 只算地址。
+8. **以为 `test` 会改操作数**：`test` 只改标志位。
+
+## 6. 练习
+
+1. 把 `cmp rax, 55` 改成 `cmp rax, 56`，确认退出码变成 1；再改回来。
+2. 把 `ARR_LEN` 改成 9，循环只加前 9 个元素；预期和是多少？自检位会怎样？
+3. 把字符串改成 `"hello, asm"`，同步修改长度检查，观察退出码。
+4. 把 `div ecx` 换成 `idiv ecx`，并用 `mov eax, -42` / `cdq` / `mov ecx, 6` 计算 -42 / 6，验证商和余数。
+5. 在 `sum_qwords` 入口加一条 `nop`，用 GDB `b sum_qwords` 观察 `RSP % 16 == 8`，再 `si` 三次观察序言后的对齐。
+
+## 7. 下一章
+
+第 04 章处理历史包袱：把 16 位 MASM 的写法逐条翻译成 NASM x64——段寄存器、`int 21h`、`offset`、`dup`、`mov ax, 0B800h` 这些老朋友在 64 位下分别该怎么做。

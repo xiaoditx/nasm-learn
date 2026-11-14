@@ -1,0 +1,243 @@
+     1                                  ; ============================================================
+     2                                  ; 第 09 章：堆内存与结构体 —— HeapAlloc + struc/endstruc + 链表
+     3                                  ; 运行：.\heap_structs.exe
+     4                                  ; 说明：ITEM 由 NASM 的 struc 定义，堆上分配 3 个节点并串成链表。
+     5                                  ; ============================================================
+     6                                  default rel
+     7                                  %include "../common.asm"
+     1                              <1> ; ============================================================
+     2                              <1> ; common.asm —— 全项目共享定义
+     3                              <1> ; 只包含预处理指令、常量与宏，不产生任何段/数据。
+     4                              <1> ; 用法：在章节目录中写  %include "../common.asm"
+     5                              <1> ; ============================================================
+     6                              <1> 
+     7                              <1> ; ---------- Windows x64 栈约定 ----------
+     8                              <1> %define SHADOW_SPACE          32      ; 调用前必须预留的影子空间
+     9                              <1> %define ENTRY_SUB_RSP         40      ; 入口 RSP%16==8 → 减 40 后 %16==0
+    10                              <1> %define FRAME_SUB_RSP         32      ; push rbp 之后 %16==0 → 再减 32
+    11                              <1> 
+    12                              <1> ; ---------- 通用常量 ----------
+    13                              <1> %define NULL                  0
+    14                              <1> %define TRUE                  1
+    15                              <1> %define FALSE                 0
+    16                              <1> %define WCHAR_SIZE            2       ; UTF-16 码元大小
+    17                              <1> %define MAX_PATH_W            260
+    18                              <1> 
+    19                              <1> ; ---------- 标准设备 ----------
+    20                              <1> %define STD_OUTPUT_HANDLE     -11
+    21                              <1> %define STD_ERROR_HANDLE      -12
+    22                              <1> 
+    23                              <1> ; ---------- 文件 ----------
+    24                              <1> %define INVALID_HANDLE_VALUE  -1
+    25                              <1> %define GENERIC_READ          0x80000000
+    26                              <1> %define GENERIC_WRITE         0x40000000
+    27                              <1> %define CREATE_ALWAYS         2
+    28                              <1> %define OPEN_EXISTING         3
+    29                              <1> %define FILE_ATTRIBUTE_NORMAL 0x80
+    30                              <1> 
+    31                              <1> ; ---------- 错误码 ----------
+    32                              <1> %define ERROR_FILE_NOT_FOUND  2
+    33                              <1> %define ERROR_PATH_NOT_FOUND  3
+    34                              <1> %define ERROR_ACCESS_DENIED   5
+    35                              <1> 
+    36                              <1> ; ---------- 代码页 ----------
+    37                              <1> %define CP_UTF8               65001
+    38                              <1> 
+    39                              <1> ; ---------- 堆 ----------
+    40                              <1> %define HEAP_ZERO_MEMORY      8
+    41                              <1> 
+    42                              <1> ; ---------- 宽字符串宏（UTF-16LE） ----------
+    43                              <1> ; WSTR  ：展开为 UTF-16LE 码元，不带结尾 0
+    44                              <1> ; WSTRZ ：展开为 UTF-16LE 码元，并追加一个 0 结尾
+    45                              <1> %macro WSTR 1
+    46                              <1>     dw __utf16__(%1)
+    47                              <1> %endmacro
+    48                              <1> 
+    49                              <1> %macro WSTRZ 1
+    50                              <1>     dw __utf16__(%1), 0
+    51                              <1> %endmacro
+    52                              <1> 
+    53                              <1> ; ---------- 第 12 章：文本统计结构（多个 .asm 共用） ----------
+    54                              <1> struc TEXT_STATS
+    55 00000000 ????????            <1>     .chars: resd 1
+    56 00000004 ????????            <1>     .lines: resd 1
+    57 00000008 ????????            <1>     .words: resd 1
+    58                              <1> endstruc
+     8                                  
+     9                                  ; ---------- 结构体定义（只产生偏移常量，不占内存） ----------
+    10                                  struc ITEM
+    11 00000000 ????????                    .id:    resd 1      ; +0
+    12 00000004 ????????                    .value: resd 1      ; +4
+    13 00000008 ????????????????            .next:  resq 1      ; +8
+    14                                  endstruc               ; NASM 自动产生 ITEM_size = 16
+    15                                  
+    16                                  section .data
+    17                                      static_item:
+    18                                          istruc ITEM
+    19 00000000 63000000                            at ITEM.id,    dd 99
+    20 00000004 D2040000                            at ITEM.value, dd 1234
+    21 00000008 0000000000000000                    at ITEM.next,  dq 0
+    22                                          iend
+    23                                  
+    24                                  section .rdata
+    25                                      fmt_alloc:  WSTR "allocated %d bytes for %d items (ITEM_size=%d)"
+    25                              <1>  fmt_alloc: 
+    46 00000000 61006C006C006F0063- <1>  dw __utf16__(%1)
+    46 00000009 006100740065006400- <1>
+    46 00000012 200025006400200062- <1>
+    46 0000001B 007900740065007300- <1>
+    46 00000024 200066006F00720020- <1>
+    46 0000002D 002500640020006900- <1>
+    46 00000036 740065006D00730020- <1>
+    46 0000003F 002800490054004500- <1>
+    46 00000048 4D005F00730069007A- <1>
+    46 00000051 0065003D0025006400- <1>
+    46 0000005A 2900                <1>
+    26 0000005C 0A000000                                dw 10, 0
+    27                                      fmt_item:   WSTR "item id=%d value=%d"
+    27                              <1>  fmt_item: 
+    46 00000060 6900740065006D0020- <1>  dw __utf16__(%1)
+    46 00000069 00690064003D002500- <1>
+    46 00000072 64002000760061006C- <1>
+    46 0000007B 00750065003D002500- <1>
+    46 00000084 6400                <1>
+    28 00000086 0A000000                                dw 10, 0
+    29                                      fmt_sum:    WSTR "sum of values = %d"
+    29                              <1>  fmt_sum: 
+    46 0000008A 730075006D0020006F- <1>  dw __utf16__(%1)
+    46 00000093 006600200076006100- <1>
+    46 0000009C 6C0075006500730020- <1>
+    46 000000A5 003D00200025006400  <1>
+    30 000000AE 0A000000                                dw 10, 0
+    31                                      fmt_static: WSTR "static item: id=%d value=%d"
+    31                              <1>  fmt_static: 
+    46 000000B2 730074006100740069- <1>  dw __utf16__(%1)
+    46 000000BB 006300200069007400- <1>
+    46 000000C4 65006D003A00200069- <1>
+    46 000000CD 0064003D0025006400- <1>
+    46 000000D6 2000760061006C0075- <1>
+    46 000000DF 0065003D0025006400  <1>
+    32 000000E8 0A000000                                dw 10, 0
+    33                                      msg_free:   WSTR "HeapFree done"
+    33                              <1>  msg_free: 
+    46 000000EC 480065006100700046- <1>  dw __utf16__(%1)
+    46 000000F5 007200650065002000- <1>
+    46 000000FE 64006F006E006500    <1>
+    34 00000106 0A000000                                dw 10, 0
+    35                                  
+    36                                  section .bss
+    37 00000000 ????????                    stats:      resd 1              ; 仅作占位，保持 .bss 非空
+    38                                  
+    39                                  section .text
+    40                                      global  wmain
+    41                                      extern  wprintf
+    42                                      extern  GetProcessHeap
+    43                                      extern  HeapAlloc
+    44                                      extern  HeapFree
+    45                                  
+    46                                  wmain:
+    47 00000000 55                          push    rbp
+    48 00000001 4889E5                      mov     rbp, rsp
+    49 00000004 4883EC40                    sub     rsp, 64                 ; 32 影子 + 32 本地槽
+    50                                  
+    51                                  ; ---------- 1. 取进程堆 ----------
+    52 00000008 E8(00000000)                call    GetProcessHeap
+    53 0000000D 488945F0                    mov     qword [rbp - 16], rax
+    54                                  
+    55                                  ; ---------- 2. 分配 3 个 ITEM ----------
+    56 00000011 4889C1                      mov     rcx, rax
+    57 00000014 BA08000000                  mov     edx, HEAP_ZERO_MEMORY
+    58 00000019 41B830000000                mov     r8d, 3 * ITEM_size
+    59 0000001F E8(00000000)                call    HeapAlloc
+    60 00000024 4885C0                      test    rax, rax
+    61 00000027 0F84E3000000                jz      .fail
+    62 0000002D 488945F8                    mov     qword [rbp - 8], rax    ; base
+    63                                  
+    64                                  ; ---------- 3. 填充并串联 ----------
+    65 00000031 31C9                        xor     ecx, ecx                ; i = 0
+    66                                  .fill:
+    67 00000033 83F903                      cmp     ecx, 3
+    68 00000036 7D30                        jge     .fill_done
+    69                                  
+    70 00000038 4889C8                      mov     rax, rcx
+    71 0000003B 48C1E004                    shl     rax, 4                  ; i * 16 = i * ITEM_size
+    72 0000003F 480345F8                    add     rax, qword [rbp - 8]
+    73                                  
+    74 00000043 8908                        mov     dword [rax + ITEM.id], ecx
+    75 00000045 89CA                        mov     edx, ecx
+    76 00000047 0FAFD1                      imul    edx, ecx                ; value = i * i
+    77 0000004A 895004                      mov     dword [rax + ITEM.value], edx
+    78                                  
+    79 0000004D 83F902                      cmp     ecx, 2
+    80 00000050 7D0A                        jge     .last
+    81 00000052 488D5010                    lea     rdx, [rax + ITEM_size]
+    82 00000056 48895008                    mov     qword [rax + ITEM.next], rdx
+    83 0000005A EB08                        jmp     .linked
+    84                                  .last:
+    85 0000005C 48C7400800000000            mov     qword [rax + ITEM.next], NULL
+    86                                  .linked:
+    87 00000064 FFC1                        inc     ecx
+    88 00000066 EBCB                        jmp     .fill
+    89                                  .fill_done:
+    90                                  
+    91                                  ; ---------- 4. 打印分配信息 ----------
+    92 00000068 488D0D(00000000)            lea     rcx, [rel fmt_alloc]
+    93 0000006F BA30000000                  mov     edx, 3 * ITEM_size
+    94 00000074 41B803000000                mov     r8d, 3
+    95 0000007A 41B910000000                mov     r9d, ITEM_size
+    96 00000080 31C0                        xor     eax, eax
+    97 00000082 E8(00000000)                call    wprintf
+    98                                  
+    99                                  ; ---------- 5. 遍历链表 ----------
+   100 00000087 488B45F8                    mov     rax, qword [rbp - 8]
+   101 0000008B 488945E8                    mov     qword [rbp - 24], rax   ; 当前节点
+   102 0000008F C745E000000000              mov     dword [rbp - 32], 0     ; sum
+   103                                  .walk:
+   104 00000096 488B45E8                    mov     rax, qword [rbp - 24]
+   105 0000009A 4885C0                      test    rax, rax
+   106 0000009D 7424                        jz      .walk_done
+   107                                  
+   108 0000009F 8B10                        mov     edx, dword [rax + ITEM.id]
+   109 000000A1 448B4004                    mov     r8d, dword [rax + ITEM.value]
+   110 000000A5 4C8B4808                    mov     r9, qword [rax + ITEM.next]
+   111 000000A9 4C894DE8                    mov     qword [rbp - 24], r9    ; 先前进，避免被 call 覆盖
+   112                                  
+   113 000000AD 4489C1                      mov     ecx, r8d
+   114 000000B0 014DE0                      add     dword [rbp - 32], ecx
+   115                                  
+   116 000000B3 488D0D(60000000)            lea     rcx, [rel fmt_item]
+   117 000000BA 31C0                        xor     eax, eax
+   118 000000BC E8(00000000)                call    wprintf
+   119 000000C1 EBD3                        jmp     .walk
+   120                                  .walk_done:
+   121                                  
+   122 000000C3 488D0D(8A000000)            lea     rcx, [rel fmt_sum]
+   123 000000CA 8B55E0                      mov     edx, dword [rbp - 32]
+   124 000000CD 31C0                        xor     eax, eax
+   125 000000CF E8(00000000)                call    wprintf
+   126                                  
+   127                                  ; ---------- 6. 打印静态结构体 ----------
+   128 000000D4 488D0D(B2000000)            lea     rcx, [rel fmt_static]
+   129 000000DB 8B15(00000000)              mov     edx, dword [rel static_item + ITEM.id]
+   130 000000E1 448B05(04000000)            mov     r8d, dword [rel static_item + ITEM.value]
+   131 000000E8 31C0                        xor     eax, eax
+   132 000000EA E8(00000000)                call    wprintf
+   133                                  
+   134                                  ; ---------- 7. 释放 ----------
+   135 000000EF 488B4DF0                    mov     rcx, qword [rbp - 16]
+   136 000000F3 31D2                        xor     edx, edx
+   137 000000F5 4C8B45F8                    mov     r8, qword [rbp - 8]
+   138 000000F9 E8(00000000)                call    HeapFree
+   139                                  
+   140 000000FE 488D0D(EC000000)            lea     rcx, [rel msg_free]
+   141 00000105 31C0                        xor     eax, eax
+   142 00000107 E8(00000000)                call    wprintf
+   143                                  
+   144 0000010C 31C0                        xor     eax, eax
+   145 0000010E C9                          leave
+   146 0000010F C3                          ret
+   147                                  
+   148                                  .fail:
+   149 00000110 B801000000                  mov     eax, 1
+   150 00000115 C9                          leave
+   151 00000116 C3                          ret

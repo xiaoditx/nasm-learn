@@ -1,0 +1,45 @@
+     1                                  ; ============================================================
+     2                                  ; 第 04 章：从 16 位 MASM 迁移到 NASM x64
+     3                                  ;
+     4                                  ; 本章程序把“16 位时代算 VGA 文本缓冲区地址”的写法，
+     5                                  ; 原样翻译成 64 位 NASM，用退出码验证结果。
+     6                                  ;
+     7                                  ; 构建（在本目录下执行）：
+     8                                  ;   nasm -f win64 -l port16.lst -o port16.obj port16.asm
+     9                                  ;   ld -o port16.exe port16.obj -L "C:/msys64/ucrt64/lib" -lkernel32 --subsystem console --entry=_start
+    10                                  ;
+    11                                  ; 运行后退出码应为 234：
+    12                                  ;   .\port16.exe
+    13                                  ;   $LASTEXITCODE
+    14                                  ; ============================================================
+    15                                  
+    16                                  default rel
+    17                                  
+    18                                  section .text
+    19                                      global _start
+    20                                      extern ExitProcess
+    21                                  
+    22                                  _start:
+    23 00000000 4883EC28                    sub rsp, 40
+    24                                  
+    25                                      ; 16 位 MASM 常写成：mov ax, 0B800h
+    26                                      ; NASM 十六进制写作 0xB800；但 64 位下段基址不再自动加，
+    27                                      ; 所以这里直接使用线性地址 0xB8000。
+    28 00000004 B800800B00                  mov eax, 0xB8000
+    29                                  
+    30                                      ; 16 位：mov cx, 3 / mov ax, 80 / mul cx
+    31                                      ; 64 位：三操作数 imul 更直接
+    32 00000009 B903000000                  mov ecx, 3
+    33 0000000E 6BC950                      imul ecx, ecx, 80               ; 行号 * 每行 80 列
+    34 00000011 83C105                      add ecx, 5                      ; 列号 5
+    35 00000014 D1E1                        shl ecx, 1                      ; 每个字符单元 2 字节
+    36                                  
+    37                                      ; 相加得到 0xB8000 + (3*80+5)*2 = 0xB81EA
+    38 00000016 01C8                        add eax, ecx
+    39                                  
+    40                                      ; 16 位时代常用 and al, 0Fh 之类的截断；
+    41                                      ; 这里只保留低 8 位 → 0xEA
+    42 00000018 25FF000000                  and eax, 0xFF
+    43                                  
+    44 0000001D 89C1                        mov ecx, eax
+    45 0000001F E8(00000000)                call ExitProcess                ; 退出码 234

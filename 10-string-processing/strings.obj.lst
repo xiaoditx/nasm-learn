@@ -1,0 +1,281 @@
+     1                                  ; ============================================================
+     2                                  ; 第 10 章：UTF-16 字符串处理
+     3                                  ; 演示：长度、ASCII 大小写转换、单词计数、逐码元打印
+     4                                  ; 运行：.\strings.exe
+     5                                  ; 注意：UTF-16 的一个“码元”是 2 字节；BMP 内一个汉字占 1 个码元。
+     6                                  ; ============================================================
+     7                                  default rel
+     8                                  %include "../common.asm"
+     1                              <1> ; ============================================================
+     2                              <1> ; common.asm —— 全项目共享定义
+     3                              <1> ; 只包含预处理指令、常量与宏，不产生任何段/数据。
+     4                              <1> ; 用法：在章节目录中写  %include "../common.asm"
+     5                              <1> ; ============================================================
+     6                              <1> 
+     7                              <1> ; ---------- Windows x64 栈约定 ----------
+     8                              <1> %define SHADOW_SPACE          32      ; 调用前必须预留的影子空间
+     9                              <1> %define ENTRY_SUB_RSP         40      ; 入口 RSP%16==8 → 减 40 后 %16==0
+    10                              <1> %define FRAME_SUB_RSP         32      ; push rbp 之后 %16==0 → 再减 32
+    11                              <1> 
+    12                              <1> ; ---------- 通用常量 ----------
+    13                              <1> %define NULL                  0
+    14                              <1> %define TRUE                  1
+    15                              <1> %define FALSE                 0
+    16                              <1> %define WCHAR_SIZE            2       ; UTF-16 码元大小
+    17                              <1> %define MAX_PATH_W            260
+    18                              <1> 
+    19                              <1> ; ---------- 标准设备 ----------
+    20                              <1> %define STD_OUTPUT_HANDLE     -11
+    21                              <1> %define STD_ERROR_HANDLE      -12
+    22                              <1> 
+    23                              <1> ; ---------- 文件 ----------
+    24                              <1> %define INVALID_HANDLE_VALUE  -1
+    25                              <1> %define GENERIC_READ          0x80000000
+    26                              <1> %define GENERIC_WRITE         0x40000000
+    27                              <1> %define CREATE_ALWAYS         2
+    28                              <1> %define OPEN_EXISTING         3
+    29                              <1> %define FILE_ATTRIBUTE_NORMAL 0x80
+    30                              <1> 
+    31                              <1> ; ---------- 错误码 ----------
+    32                              <1> %define ERROR_FILE_NOT_FOUND  2
+    33                              <1> %define ERROR_PATH_NOT_FOUND  3
+    34                              <1> %define ERROR_ACCESS_DENIED   5
+    35                              <1> 
+    36                              <1> ; ---------- 代码页 ----------
+    37                              <1> %define CP_UTF8               65001
+    38                              <1> 
+    39                              <1> ; ---------- 堆 ----------
+    40                              <1> %define HEAP_ZERO_MEMORY      8
+    41                              <1> 
+    42                              <1> ; ---------- 宽字符串宏（UTF-16LE） ----------
+    43                              <1> ; WSTR  ：展开为 UTF-16LE 码元，不带结尾 0
+    44                              <1> ; WSTRZ ：展开为 UTF-16LE 码元，并追加一个 0 结尾
+    45                              <1> %macro WSTR 1
+    46                              <1>     dw __utf16__(%1)
+    47                              <1> %endmacro
+    48                              <1> 
+    49                              <1> %macro WSTRZ 1
+    50                              <1>     dw __utf16__(%1), 0
+    51                              <1> %endmacro
+    52                              <1> 
+    53                              <1> ; ---------- 第 12 章：文本统计结构（多个 .asm 共用） ----------
+    54                              <1> struc TEXT_STATS
+    55 00000000 ????????            <1>     .chars: resd 1
+    56 00000004 ????????            <1>     .lines: resd 1
+    57 00000008 ????????            <1>     .words: resd 1
+    58                              <1> endstruc
+     9                                  
+    10                                  section .rdata
+    11                                      sample:         WSTR "x64 assembly 汇编"
+    11                              <1>  sample: 
+    46 00000000 780036003400200061- <1>  dw __utf16__(%1)
+    46 00000009 007300730065006D00- <1>
+    46 00000012 62006C007900200047- <1>
+    46 0000001B 6C167F              <1>
+    12                                      sample_len      equ ($ - sample) / WCHAR_SIZE
+    13 0000001E 0000                                        dw 0
+    14                                  
+    15                                      sample_ascii:   WSTR "x64 assembly"
+    15                              <1>  sample_ascii: 
+    46 00000020 780036003400200061- <1>  dw __utf16__(%1)
+    46 00000029 007300730065006D00- <1>
+    46 00000032 62006C007900        <1>
+    16 00000038 0000                                        dw 0
+    17                                      words_text:     WSTR "one two three four"
+    17                              <1>  words_text: 
+    46 0000003A 6F006E006500200074- <1>  dw __utf16__(%1)
+    46 00000043 0077006F0020007400- <1>
+    46 0000004C 680072006500650020- <1>
+    46 00000055 0066006F0075007200  <1>
+    18                                      words_len       equ ($ - words_text) / WCHAR_SIZE
+    19 0000005E 0000                                        dw 0
+    20                                  
+    21                                      fmt_len:    WSTR "length of sample = %d WCHAR units"
+    21                              <1>  fmt_len: 
+    46 00000060 6C0065006E00670074- <1>  dw __utf16__(%1)
+    46 00000069 00680020006F006600- <1>
+    46 00000072 2000730061006D0070- <1>
+    46 0000007B 006C00650020003D00- <1>
+    46 00000084 200025006400200057- <1>
+    46 0000008D 004300480041005200- <1>
+    46 00000096 200075006E00690074- <1>
+    46 0000009F 007300              <1>
+    22 000000A2 0A000000                                dw 10, 0
+    23                                      fmt_upper:  WSTR "uppercase = %ls"
+    23                              <1>  fmt_upper: 
+    46 000000A6 750070007000650072- <1>  dw __utf16__(%1)
+    46 000000AF 006300610073006500- <1>
+    46 000000B8 20003D00200025006C- <1>
+    46 000000C1 007300              <1>
+    24 000000C4 0A000000                                dw 10, 0
+    25                                      fmt_words:  WSTR "words = %d"
+    25                              <1>  fmt_words: 
+    46 000000C8 77006F007200640073- <1>  dw __utf16__(%1)
+    46 000000D1 0020003D0020002500- <1>
+    46 000000DA 6400                <1>
+    26 000000DC 0A000000                                dw 10, 0
+    27                                      fmt_code:   WSTRZ "U+%04X "
+    27                              <1>  fmt_code: 
+    50 000000E0 55002B002500300034- <1>  dw __utf16__(%1), 0
+    50 000000E9 00580020000000      <1>
+    28 000000F0 0A000000                    fmt_nl:     dw 10, 0
+    29                                      msg_codes:  WSTR "code units: "
+    29                              <1>  msg_codes: 
+    46 000000F4 63006F006400650020- <1>  dw __utf16__(%1)
+    46 000000FD 0075006E0069007400- <1>
+    46 00000106 73003A002000        <1>
+    30 0000010C 0000                                    dw 0
+    31                                  
+    32                                  section .bss
+    33 00000000 <res 80h>                   upper_buf:  resw 64
+    34                                  
+    35                                  section .text
+    36                                      global  wmain
+    37                                      extern  wprintf
+    38                                  
+    39                                  ; ------------------------------------------------------------
+    40                                  ; size_t wlen(wchar_t *s)
+    41                                  ;   RCX = 字符串地址；返回 EAX = 码元个数
+    42                                  ; ------------------------------------------------------------
+    43                                  wlen:
+    44 00000000 31C0                        xor     eax, eax
+    45                                  .loop:
+    46 00000002 66833C4100                  cmp     word [rcx + rax*2], 0
+    47 00000007 7404                        je      .done
+    48 00000009 FFC0                        inc     eax
+    49 0000000B EBF5                        jmp     .loop
+    50                                  .done:
+    51 0000000D C3                          ret
+    52                                  
+    53                                  ; ------------------------------------------------------------
+    54                                  ; void ascii_upper(wchar_t *src, wchar_t *dst)
+    55                                  ;   RCX = 源，RDX = 目标；只转换 ASCII 的 a~z
+    56                                  ;   RSI / RDI 是非易失寄存器，必须保存
+    57                                  ; ------------------------------------------------------------
+    58                                  ascii_upper:
+    59 0000000E 56                          push    rsi
+    60 0000000F 57                          push    rdi
+    61 00000010 4889CE                      mov     rsi, rcx
+    62 00000013 4889D7                      mov     rdi, rdx
+    63                                  .loop:
+    64 00000016 668B06                      mov     ax, word [rsi]
+    65 00000019 6685C0                      test    ax, ax
+    66 0000001C 741D                        jz      .done
+    67 0000001E 6683F861                    cmp     ax, 'a'
+    68 00000022 720A                        jb      .store
+    69 00000024 6683F87A                    cmp     ax, 'z'
+    70 00000028 7704                        ja      .store
+    71 0000002A 6683E820                    sub     ax, 32
+    72                                  .store:
+    73 0000002E 668907                      mov     word [rdi], ax
+    74 00000031 4883C602                    add     rsi, WCHAR_SIZE
+    75 00000035 4883C702                    add     rdi, WCHAR_SIZE
+    76 00000039 EBDB                        jmp     .loop
+    77                                  .done:
+    78 0000003B 66C7070000                  mov     word [rdi], 0
+    79 00000040 5F                          pop     rdi
+    80 00000041 5E                          pop     rsi
+    81 00000042 C3                          ret
+    82                                  
+    83                                  ; ------------------------------------------------------------
+    84                                  ; int count_words(wchar_t *s, int len)
+    85                                  ;   RCX = 字符串，EDX = 码元数；返回 EAX = 单词数
+    86                                  ;   分隔符：空格、TAB、CR、LF
+    87                                  ; ------------------------------------------------------------
+    88                                  count_words:
+    89 00000043 31C0                        xor     eax, eax                ; 单词数
+    90 00000045 4531C0                      xor     r8d, r8d                ; in_word
+    91 00000048 4531C9                      xor     r9d, r9d                ; i
+    92                                  .loop:
+    93 0000004B 4139D1                      cmp     r9d, edx
+    94 0000004E 7338                        jae     .done
+    95 00000050 66468B1449                  mov     r10w, word [rcx + r9*2]
+    96                                  
+    97 00000055 664183FA20                  cmp     r10w, ' '
+    98 0000005A 7424                        je      .sep
+    99 0000005C 664183FA09                  cmp     r10w, 9
+   100 00000061 741D                        je      .sep
+   101 00000063 664183FA0D                  cmp     r10w, 13
+   102 00000068 7416                        je      .sep
+   103 0000006A 664183FA0A                  cmp     r10w, 10
+   104 0000006F 740F                        je      .sep
+   105                                  
+   106 00000071 4585C0                      test    r8d, r8d
+   107 00000074 750D                        jnz     .next
+   108 00000076 41B801000000                mov     r8d, 1
+   109 0000007C FFC0                        inc     eax
+   110 0000007E EB03                        jmp     .next
+   111                                  .sep:
+   112 00000080 4531C0                      xor     r8d, r8d
+   113                                  .next:
+   114 00000083 41FFC1                      inc     r9d
+   115 00000086 EBC3                        jmp     .loop
+   116                                  .done:
+   117 00000088 C3                          ret
+   118                                  
+   119                                  ; ------------------------------------------------------------
+   120                                  ; int wmain(int argc, wchar_t **argv)
+   121                                  ; ------------------------------------------------------------
+   122                                  wmain:
+   123 00000089 55                          push    rbp
+   124 0000008A 4889E5                      mov     rbp, rsp
+   125 0000008D 4883EC40                    sub     rsp, 64
+   126                                  
+   127 00000091 488D0D(00000000)            lea     rcx, [rel sample]
+   128 00000098 E863FFFFFF                  call    wlen
+   129 0000009D 8945FC                      mov     dword [rbp - 4], eax    ; 保存长度
+   130                                  
+   131 000000A0 488D0D(60000000)            lea     rcx, [rel fmt_len]
+   132 000000A7 8B55FC                      mov     edx, dword [rbp - 4]
+   133 000000AA 31C0                        xor     eax, eax
+   134 000000AC E8(00000000)                call    wprintf
+   135                                  
+   136                                  ; ---------- ASCII 大小写 ----------
+   137 000000B1 488D0D(20000000)            lea     rcx, [rel sample_ascii]
+   138 000000B8 488D15(00000000)            lea     rdx, [rel upper_buf]
+   139 000000BF E84AFFFFFF                  call    ascii_upper
+   140                                  
+   141 000000C4 488D0D(A6000000)            lea     rcx, [rel fmt_upper]
+   142 000000CB 488D15(00000000)            lea     rdx, [rel upper_buf]
+   143 000000D2 31C0                        xor     eax, eax
+   144 000000D4 E8(00000000)                call    wprintf
+   145                                  
+   146                                  ; ---------- 单词计数 ----------
+   147 000000D9 488D0D(3A000000)            lea     rcx, [rel words_text]
+   148 000000E0 BA12000000                  mov     edx, words_len
+   149 000000E5 E859FFFFFF                  call    count_words
+   150                                  
+   151 000000EA 488D0D(C8000000)            lea     rcx, [rel fmt_words]
+   152 000000F1 89C2                        mov     edx, eax
+   153 000000F3 31C0                        xor     eax, eax
+   154 000000F5 E8(00000000)                call    wprintf
+   155                                  
+   156                                  ; ---------- 逐码元打印 ----------
+   157 000000FA 488D0D(F4000000)            lea     rcx, [rel msg_codes]
+   158 00000101 31C0                        xor     eax, eax
+   159 00000103 E8(00000000)                call    wprintf
+   160                                  
+   161 00000108 488D05(00000000)            lea     rax, [rel sample]
+   162 0000010F 488945F0                    mov     qword [rbp - 16], rax   ; 基址
+   163 00000113 C745F800000000              mov     dword [rbp - 8], 0      ; i
+   164                                  .code_loop:
+   165 0000011A 8B45F8                      mov     eax, dword [rbp - 8]
+   166 0000011D 3B45FC                      cmp     eax, dword [rbp - 4]
+   167 00000120 7D1C                        jge     .codes_done
+   168                                  
+   169 00000122 4C8B45F0                    mov     r8, qword [rbp - 16]
+   170 00000126 410FB71440                  movzx   edx, word [r8 + rax*2]
+   171 0000012B 488D0D(E0000000)            lea     rcx, [rel fmt_code]
+   172 00000132 31C0                        xor     eax, eax
+   173 00000134 E8(00000000)                call    wprintf
+   174                                  
+   175 00000139 FF45F8                      inc     dword [rbp - 8]
+   176 0000013C EBDC                        jmp     .code_loop
+   177                                  .codes_done:
+   178 0000013E 488D0D(F0000000)            lea     rcx, [rel fmt_nl]
+   179 00000145 31C0                        xor     eax, eax
+   180 00000147 E8(00000000)                call    wprintf
+   181                                  
+   182 0000014C 31C0                        xor     eax, eax
+   183 0000014E C9                          leave
+   184 0000014F C3                          ret
