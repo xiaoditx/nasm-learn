@@ -20,14 +20,16 @@
 跑通后你应该能回答：
 
 - `_start` 的第一条指令执行时，`RCX` 里是 `argc` 吗？
-- 为什么 `wmain` 里写 `return 0` 就行，`_start` 里 `ret` 就会挂起？
+- 为什么 `wmain` 里写 `return 0` 就行，自定义 `_start` 却应显式调用 `ExitProcess`，而不是依赖 `ret`？
 - `-nostartfiles` 去掉了什么？为什么还要 `-Wl,-e,_start`？
 - 为什么说"WriteConsoleW 在重定向下失败"恰好说明了 CRT 存在的意义？
 
 ## 2. 前置 / 项目结构
 
+前置：第 06 章的 CRT 与 ABI、第 08 章的句柄、第 10 章的 UTF-16 码元。本章新增的是绕过 CRT 后的入口与退出责任，不再引入新的调用约定。
+
 ```text
-masm-learn/
+nasm-learn/
 ├── common.asm            ENTRY_SUB_RSP / STD_OUTPUT_HANDLE / WSTR 宏
 └── 20-no-crt-start/
     ├── Makefile
@@ -40,9 +42,9 @@ masm-learn/
 
 ## 3. 知识点讲解
 
-### 3.1 Windows x64 ABI 四件套
+### 3.1 ABI 复习：无 CRT 入口仍要遵守同一套约定
 
-Windows x64 调用约定是本章所有代码的地基，必须先立住。
+第 06 章已经系统讲过这些规则。这里只强调 `WriteConsoleW` 的第 5 参数，以及 `_start` 与普通函数在返回方式上的差别。
 
 **① 参数传递：前四进寄存器，其余走栈**
 
@@ -69,15 +71,15 @@ Windows x64 调用约定是本章所有代码的地基，必须先立住。
 **③ 16 字节对齐**
 
 ```text
-_start 入口      RSP % 16 == 8     ← 调用者（ntdll 加载器）call 时压了返回地址
-sub rsp, 40      RSP % 16 == 0     ← 之后每个 call 点都满足对齐
+_start 入口（本工具链与系统环境实测）  RSP % 16 == 8
+sub rsp, 40                           RSP % 16 == 0
 ```
 
-推论：**函数入口处 `RSP % 16 == 8`，`call` 指令执行的那一刻 `RSP % 16 == 0`**。
+它与普通函数入口的余 8 数值相同，但不能据此推断一定是某个加载器函数执行了 `call`。`_start` 也没有 `wmain(argc, argv)` 那套寄存器参数约定；本章只采用当前环境实测的栈对齐前提，并通过后续调实验证。普通函数仍遵循：**入口处 `RSP % 16 == 8`，`call` 指令执行前 `RSP % 16 == 0`**。
 
 **④ 非易失寄存器**
 
-`RBX / RBP / RDI / RSI / R12~R15 / XMM6~15` 是被调用方必须保存的非易失寄存器。但 `_start` 是**进程的起点，没有调用者会回到这里**（`ret` 等于自杀），所以我们可以随便用 `RBX/RSI` 而不恢复——这是全书唯一一个"破坏非易失寄存器不算违规"的函数。本章用 `RBX` 存控制台句柄、`RSI` 存命令行指针，正是利用这一点。
+`RBX/RBP/RDI/RSI/R12～R15/XMM6～XMM15` 是普通被调方必须保存的非易失寄存器。本章 `_start` 最终以 `ExitProcess` 终结整个进程，不会返回后继续执行调用者代码，因此不需要为“返回后的调用者”恢复 `RBX/RSI`。这是进程入口主动不返回带来的简化，**不表示 `_start` 没有加载器管理的外层执行帧，也不能类推到普通函数**。本章用 `RBX` 存控制台句柄、`RSI` 存命令行指针。
 
 > 反过来也成立：只要我们还想调 API，那 40 字节栈帧和 16 字节对齐就必须维持，因为 **API 内部会按 ABI 假设我们的栈**。
 
@@ -97,7 +99,7 @@ wmainCRTStartup:
 
 | 以前 CRT 代劳 | 现在怎么办 |
 |---|---|
-| 解析命令行为 argc/argv | 自己调 `GetCommandLineW`（本章只打印原串；第 21 章起再解析） |
+| 解析命令行为 argc/argv | 自己调 `GetCommandLineW`（本章只打印原串；解析练习可用 `CommandLineToArgvW`） |
 | 提供 wprintf 等输出 | 直接调 `WriteConsoleW` |
 | return 后收尾退出 | 必须显式 `ExitProcess` |
 | 默认入口符号 | `-Wl,-e,_start` 显式指定 |
@@ -108,7 +110,7 @@ wmainCRTStartup:
 
 `WriteConsoleW` **只能写控制台屏幕缓冲区**。当进程的标准输出被重定向到管道（IDE、CI、`cmd /c start.exe | more`）或文件时，`GetStdHandle` 拿到的是管道/文件句柄，`WriteConsoleW` 对它返回 `FALSE` 并报 `ERROR_INVALID_FUNCTION`（错误码 1）。
 
-这恰好回答了"CRT 有什么用"：`wprintf` 内部会检测输出目标是控制台还是管道，前者走 `WriteConsoleW`，后者自动转码后走 `WriteFile`，所以以前我们从未察觉这个区别。第 23 章我们会亲手实现这套检测与转码逻辑。
+这恰好回答了“CRT 有什么用”：CRT 输出层需要处理同类职责，例如区分控制台与其他输出句柄，并在需要时完成宽字符到目标编码的转换；具体实现路径取决于所用 CRT。第 23 章我们会亲手实现一套检测与转码逻辑。
 
 ## 4. 实践用例
 
@@ -228,18 +230,18 @@ $3 = 0                        ← sub rsp,40 之后 % 16 == 0
 
 1. **`sub rsp, ENTRY_SUB_RSP`（知识点 3.1 ②③）**：入口 `RSP%16==8`，减 40（32 影子 + 8 栈参槽）后 `%16==0`，之后每个 `call` 点都对齐。这是整个 `_start` 唯一的栈帧调整。
 
-2. **`mov ecx, STD_OUTPUT_HANDLE` + `GetStdHandle`（知识点 3.1 ①）**：`STD_OUTPUT_HANDLE = -11`，机器码 `B9F5FFFFFF`（`-11` 的 32 位补码 `0xFFFFFFF5`）。返回的句柄存进 `RBX`——因为 `_start` 无调用者，`RBX` 是"自由寄存器"。
+2. **`mov ecx, STD_OUTPUT_HANDLE` + `GetStdHandle`（知识点 3.1 ①）**：`STD_OUTPUT_HANDLE = -11`，机器码 `B9F5FFFFFF`（`-11` 的 32 位补码 `0xFFFFFFF5`）。返回的句柄存进 `RBX`。本章 `_start` 最终以 `ExitProcess` 结束进程，不会返回后继续执行调用者代码，所以这里不为返回后的调用者恢复 `RBX`；普通函数不能照抄这种简化。
 
 3. **自取命令行 + 内联 wcslen（知识点 3.2）**：CRT 的 `argc/argv` 本质上就是从 `GetCommandLineW` 的返回值解析出来的。本章只统计长度用于打印，循环里 `cmp word [rsi + rdx*2], 0` 按 UTF-16 码元扫描，所以索引是 `rdx*2`。
 
 4. **`WriteConsoleW` 的长度是码元数不是字节数（知识点 3.3）**：第三个参数 `R8D` 传的是 UTF-16 码元个数。若误传字节数会输出两倍的"字符"，尾巴全是垃圾。第 5 参数 `lpReserved` 写到 `[rsp+32]`，必须是 `qword`。
 
-5. **`ExitProcess(42)` 而非 `ret`（知识点 3.1 ④ / 3.2）**：`_start` 没有返回地址，`ret` 会弹出垃圾跳到未知地址。选 42 作为退出码，只是为了在 `$LASTEXITCODE` 里一眼认出"是我的程序正常走到底了"。
+5. **`ExitProcess(42)` 而非依赖 `ret`（知识点 3.1④/3.2）**：自定义入口由加载器接管，返回后的行为与退出状态不应由应用代码猜测；`ret` 也不是 CRT `return` 的等价物。显式 `ExitProcess` 能确定结束整个进程并设置退出码。选 42 只是为了在 `$LASTEXITCODE` 里一眼认出程序走到底。
 
 ## 6. 常见坑
 
 1. **链接警告 `cannot find entry symbol mainCRTStartup`**：用了 `-nostartfiles` 却忘了 `-Wl,-e,_start`。也许碰巧能跑，但这是未定义行为。
-2. **`_start` 里 `ret` 结束**：回到 ntdll 的残帧上，进程挂起或崩溃。必须 `ExitProcess`。
+2. **把 `_start` 的 `ret` 当正常退出**：它会返回加载器管理的外层帧，而不是执行 CRT 的退出清理；不同环境下的后续行为与退出状态不应依赖。要明确结束整个进程，应调用 `ExitProcess`。
 3. **以为 `_start` 有 argc/argv**：入口寄存器无约定，把 `RCX` 当 argc 用迟早出事。GDB 实测 `rcx = 0x3a8000`，根本不是参数。
 4. **`WriteConsoleW` 的长度传成字节数**：会输出两倍的"字符"，尾巴全是垃圾。长度单位是 UTF-16 码元。
 5. **第 5 参数写 `mov dword [rsp+32], 0`**：高 32 位残留垃圾，API 行为未定义。写 `qword`。

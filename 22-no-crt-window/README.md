@@ -21,12 +21,14 @@
 - `_start` 入口处能直接用 `RCX` 当 hInstance 吗？为什么？
 - 为什么 `_start` 里 `sub rsp, 104` 而第 13 章 `wmain` 里是 `sub rsp, 128`（push rbp 之后）？
 - GUI 子系统下 `GetStdHandle(STD_OUTPUT_HANDLE)` 拿到什么？
-- `_start` 结尾为什么不能写 `ret`？
+- `_start` 结尾为什么应显式 `ExitProcess`，而不是把 `ret` 当作标准退出方式？
 
 ## 2. 前置 / 项目结构
 
+前置：第 13 章的窗口创建与消息循环、第 20 章的无 CRT 入口、第 21 章的 ld 直连。本章把这三项旧知识组合起来，重点推导入口函数的栈帧。
+
 ```text
-masm-learn/
+nasm-learn/
 ├── common.asm              与第 13~21 章相同
 └── 22-no-crt-window/
     ├── Makefile            LD := ld，--subsystem windows
@@ -39,14 +41,16 @@ masm-learn/
 
 ## 3. 知识点讲解
 
-### 3.1 Windows x64 ABI 四件套
+### 3.1 ABI 复习：`_start` 与 `WndProc` 的不同责任
+
+第 06、13、20 章已经讲过下列规则；这里只列出本章推导栈帧时要用到的结论。
 
 1. **参数**：`RCX / RDX / R8 / R9`，第 5 个起走栈（`[rsp+32]`，每个 `qword`）。`CreateWindowExW` 有 12 个参数：前 4 个进寄存器，后 8 个（X、Y、nWidth、nHeight、hWndParent、hMenu、hInstance、lpParam）全部走栈，占 64 字节。
 2. **影子空间**：每次 `call` 前必须备好 32 字节。被调方（包括 USER32 内部）可以随意覆写 `[rsp+0..31]`。
 3. **对齐**：任何 `call` 指令执行的那一刻 `RSP % 16 == 0`。推论：函数**入口**（`call` 压入返回地址后）`RSP % 16 == 8`。
-4. **非易失寄存器**：`RBX/RBP/RDI/RSI/R12~R15/XMM6~15` 被调方必须保。`WndProc` 被系统调用，必须守规矩；`_start` 头顶上没有调用者，本章放心用 `RBX/RDI` 而不用保存。
+4. **非易失寄存器**：`RBX/RBP/RDI/RSI/R12～R15/XMM6～XMM15` 被调方必须保存。`WndProc` 被系统调用，必须守规矩；本章 `_start` 所有出口都 `ExitProcess`、不返回继续执行调用者，所以无需为返回后的调用者恢复 `RBX/RDI`。这不表示普通函数也能省略保存。
 
-**`_start` 的特殊性**：进程入口的栈布局和"被 call 的函数"一样满足 `RSP % 16 == 8`（加载器按 ABI 布置），但**没有返回地址、没有参数约定**——`RCX/RDX/R8/R9` 里是未定义值，绝不是 WinMain 那 4 个参数。第 20 章已用 GDB 实证过这一点。
+**`_start` 的特殊性**：本工具链/系统环境中，进程入口可观察到 `RSP % 16 == 8`，当前源码据此推导栈帧；但入口没有 `WinMain/wmain` 那样的应用层参数约定，`RCX/RDX/R8/R9` 不能当作那组参数。加载器仍有自己的外层执行帧，因此不要把它描述成“栈上什么都没有”，也不要依赖入口寄存器的偶然值。
 
 ### 3.2 `_start` 与 `wmain` 的栈帧差异
 
@@ -79,14 +83,14 @@ sub     rsp, 104                ; 32 影子 + 64 传出栈参 + 8 对齐
 
 另外两个结构性差异：
 
-- **hInstance 来源**：CRT 程序里 `wmain` 的第 1 个参数就是 hInstance（CRT 启动代码调 `GetModuleHandle` 后传进来）。没有 CRT，`GetModuleHandleW(NULL)` 自己调，返回值自己存。
-- **退出方式**：`wmain` 可以 `ret`，CRT 收到返回值后调 `exit` → `ExitProcess`。`_start` 头顶没有调用者，`ret` 会弹出垃圾跳到未知地址（进程崩溃）——必须显式 `ExitProcess`。
+- **hInstance 来源**：本教程的 `wmain` 形式是 MinGW 的 Unicode 入口约定，形参是 `argc/argv/envp`，**第 1 个参数是 argc，不是 hInstance**。以前各章和本章一样调用 `GetModuleHandleW(NULL)`；`WinMain/wWinMain` 才会由 CRT 传入 `hInstance`。
+- **退出方式**：`wmain` 可以 `ret`，CRT 收到返回值后执行 `exit` 并终止进程。自定义 `_start` 的 `ret` 则回到加载器管理的外层帧，不能视为同一套退出协议；为了明确结束整个进程并指定退出码，所有出口都显式调用 `ExitProcess`。
 
 ### 3.3 GUI 子系统与标准句柄
 
-`--subsystem windows` 的进程启动时**不会**分配控制台。因此 `GetStdHandle(STD_OUTPUT_HANDLE)` 返回 `NULL`（或无效句柄），`WriteConsoleW` 直接失败。这意味着本章程序**没有任何控制台输出**——要观察行为只能靠窗口本身、调试器或退出码。
+`--subsystem windows` 的进程启动时**不会自动分配控制台**。但 `GetStdHandle(STD_OUTPUT_HANDLE)` 的结果仍取决于父进程与句柄继承：可能是 NULL/无效句柄，也可能是继承来的控制台、管道或文件句柄，不能只凭子系统字段断言。`WriteConsoleW` 还只接受合适的控制台句柄。
 
-子系统字段只影响"控制台分配"，不影响"能否创建窗口"。console 程序照样能弹窗口，只是会多带一个控制台窗口。
+本章源码根本没有获取或写标准输出，所以正常观察手段是窗口、调试器和退出码；若以后添加日志，应先检查句柄类型并选择 `WriteConsoleW` 或 `WriteFile`。子系统字段也不决定能否创建窗口：console 程序照样能创建窗口，只是从资源管理器启动时通常会带一个控制台窗口。
 
 ## 4. 实践用例
 
@@ -105,7 +109,7 @@ nasm -f win64 -l win_nocrt.obj.lst -o win_nocrt.obj win_nocrt.asm
 ld -e _start --subsystem windows -o win_nocrt.exe win_nocrt.obj -L C:/msys64/ucrt64/lib -luser32 -lkernel32
 ```
 
-链接命令与第 21 章只有两处不同：`--subsystem` 从 `console` 换成 `windows`；库从 `-lkernel32` 换成 `-luser32 -lkernel32`（窗口 API 在 USER32.dll）。**库顺序仍要在引用它们的 `.obj` 之后**，`user32` 内部会回调 `kernel32`，所以 `kernel32` 放最后。
+链接命令与第 21 章只有两处不同：`--subsystem` 从 `console` 换成 `windows`；库从 `-lkernel32` 换成 `-luser32 -lkernel32`（窗口 API 在 USER32.dll）。**两个导入库都列在引用它们的 `.obj` 之后即可**。本章直接调用 USER32 的窗口 API，也直接调用 KERNEL32 的 `GetModuleHandleW/ExitProcess`，所以两个库都需要；不能用 USER32 的内部实现来推导这里的链接顺序。
 
 ### 4.2 objdump 实证
 
@@ -174,19 +178,19 @@ start address 0x000000014000103d
 
 1. **`sub rsp, 104` 的推导（知识点 3.2）**：32 影子 + 64 栈参 = 96；入口 `RSP%16==8`，减 96 后仍是 `%16==8`，必须再减 8 才到 `%16==0`。若错减 96，`CreateWindowExW` 的 call 点 `%16==8`，USER32 内部一旦用 `movaps` 存 XMM 就 `0xC0000005`（对齐异常）。
 
-2. **`GetModuleHandleW(NULL)` 取 hInstance（知识点 3.2）**：CRT 程序的 `wmain` 第 1 个参数就是 hInstance，那是 CRT 启动代码调 `GetModuleHandle` 后传进来的。没有 CRT，入口 `RCX` 是垃圾，必须自己调。返回值存进 `.bss` 的 `hinst`，后面 `RegisterClassExW` 和 `CreateWindowExW` 都用它。
+2. **`GetModuleHandleW(NULL)` 取 hInstance（知识点 3.2）**：`_start` 的 `RCX` 不是 WinMain 参数，必须自己取得实例句柄。返回值存进 `.bss` 的 `hinst`，后面 `RegisterClassExW` 和 `CreateWindowExW` 都用它。注意本教程以前使用的 `wmain` 第一个参数是 `argc`，同样不能当 hInstance。
 
 3. **`LoadCursorW(NULL, IDC_ARROW)` 填光标**：第 13 章留空也能跑，但光标进入客户区会闪烁，正规程序都显式设。`IDC_ARROW = 32512 = 0x7f00`，机器码 `ba 00 7f 00 00`。
 
 4. **`CreateWindowExW` 的 8 个栈参（知识点 3.1 ①）**：12 参数函数，前 4 进 `RCX/RDX/R8/R9`，后 8 个从 `[rsp+32]` 起连续摆放。`[rsp+32]` 起步而非 `[rsp+0]`，因为前 32 字节是被调方的影子空间。
 
-5. **三条出口全部 `ExitProcess`（知识点 3.2）**：正常退出码 0，注册失败 1，创建窗口失败 2。`_start` 没有返回地址，`ret` 会崩溃，所有出口必须 `ExitProcess`。`WndProc` 增加 `WM_KEYDOWN`：按 ESC 调 `DestroyWindow`，窗口销毁后走 `WM_DESTROY → PostQuitMessage(0)` → 消息循环退出。
+5. **三条出口全部 `ExitProcess`（知识点 3.2）**：正常退出码 0，注册失败 1，创建窗口失败 2。这样不依赖加载器对入口返回的实现细节，退出码也明确。`WndProc` 处理 `WM_KEYDOWN`：按 ESC 调 `DestroyWindow`，随后走 `WM_DESTROY → PostQuitMessage(0)` → 消息循环退出。
 
 ## 6. 常见坑
 
-1. **GUI 子系统下标准句柄无效**：`--subsystem windows` 的进程没有控制台，`GetStdHandle(STD_OUTPUT_HANDLE)` 返回 `NULL`（或无效句柄），`WriteConsoleW` 直接失败。本章程序**没有任何控制台输出**——要观察行为只能靠窗口本身、调试器或退出码。想从 GUI 程序输出文字，用 `AllocConsole` 或写文件（第 23 章的管道检测思路与此相关）。
+1. **武断假设 GUI 子系统标准句柄一定无效**：GUI 只表示不自动分配控制台，句柄仍可能继承。本章没有任何标准输出代码；新增日志时应检查实际句柄，并按第 23 章方式选择控制台或字节流写出，也可用 `AllocConsole` 显式建控制台。
 2. **把 `_start` 的寄存器当 WinMain 参数**：入口 `RCX` 不是 hInstance。必须 `GetModuleHandleW(NULL)`。
-3. **`_start` 末尾 `ret`**：没有返回地址，`ret` 弹出的是栈顶垃圾，进程必然崩溃。所有出口都必须 `ExitProcess`。
+3. **把 `_start` 末尾 `ret` 当标准退出**：它会返回加载器外层，不执行 CRT 的退出路径，也不能由本程序明确控制整个进程的退出状态。当前程序的所有出口统一使用 `ExitProcess`。
 4. **栈参写到影子空间里**：`CreateWindowExW` 的第 5 个参数在 `[rsp+32]` 不是 `[rsp+0]`——前 32 字节是影子空间，写了也会被踩掉。
 5. **对齐少算 8 字节**：入口 `%16==8`，若 `sub rsp, 96`（只算影子+栈参），call 点 `%16==8`，USER32 内部一旦用 `movaps` 存 XMM 就 `0xC0000005`（对齐异常）。必须是 104。
 6. **链接时忘 `-luser32`**：报 `undefined reference to RegisterClassExW` 等一串——窗口 API 不在 kernel32。

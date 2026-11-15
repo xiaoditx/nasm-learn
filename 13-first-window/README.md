@@ -23,7 +23,7 @@
 ## 2. 前置 / 项目结构
 
 ```text
-masm-learn/
+nasm-learn/
 ├── common.asm                    共享常量、结构体、WSTRZ 宏
 └── 13-first-window/
     ├── Makefile
@@ -50,11 +50,13 @@ ShowWindow              让窗口可见
 消息循环 GetMessageW    不断取消息 → DispatchMessageW → 系统回调 WndProc
 ```
 
-窗口类（`WNDCLASSEXW`）是"模板"，窗口是"实例"。同一个类可以创建多个窗口。`WndProc` 是窗口过程——系统把消息投递进来，由它决定怎么响应。
+窗口类（`WNDCLASSEXW`）是“模板”，窗口是“实例”。同一个类可以创建多个窗口。注册类不等于出现窗口；只有 `CreateWindowExW` 成功返回非零 `HWND` 后，才有一个可操作的窗口实例。`WndProc` 是这个类关联的回调函数，系统按消息调用它。
 
-### 3.2 Windows x64 ABI 四件套
+这里仍然是 CRT 程序：`wmain` 由 CRT 调用，`-mwindows` 只是把 PE 子系统标记为 GUI，并选择相应链接设置，**并不要求我们必须把函数改名为 `WinMain`**。`-municode` 与 `-mwindows` 一个负责宽字符入口，一个负责 GUI 子系统，作用不同。GUI 程序通常没有附属控制台，所以后续调试应优先看窗口行为、调试器或日志文件，而不是期待 `wprintf` 一定可见。
 
-GUI 编程里这四条同样是所有崩溃的根源。
+### 3.2 ABI 复习：本章新增的 12 参数调用
+
+第 06 章已经系统讲过调用约定。这里只把它落到窗口程序上，重点看 `CreateWindowExW` 的额外栈参数；不需要重新背一遍规则。
 
 **① 前四个参数：RCX / RDX / R8 / R9**
 
@@ -89,7 +91,7 @@ GUI 编程里这四条同样是所有崩溃的根源。
 | 非易失 | `RBX`、`RBP`、`RDI`、`RSI`、`R12`~`R15`、`XMM6`~`XMM15` | 改了必须恢复 |
 | 易失 | `RAX`、`RCX`、`RDX`、`R8`~`R11`、`XMM0`~`XMM5` | 调用后不保证 |
 
-本章 `wmain` 用了 `RDI`（`rep stosd` 清零 `WNDCLASSEXW`），严格来说 `wmain` 作为被 CRT 调用的函数也应保存 `RDI`。第 15 章会演示标准的 `push rbx` / `pop rbx` 成对写法。
+本章 `wmain` 用了 `RDI`（`rep stosd` 清零 `WNDCLASSEXW`）。**现有源码没有保存并恢复它，这是一处 ABI 瑕疵**，即使示例碰巧运行正常也不能当作规范模板。`wmain` 本身也是被 CRT 调用的函数，非易失规则同样适用。可以进入函数后把旧 `RDI` 保存到不与 outgoing 参数重叠的本地槽，并在所有返回路径恢复；若改用额外的 `push rdi`，还要重新计算栈分配量，不能破坏 16 字节对齐。第 15 章的 `WndProc` 会演示 `RBX` 的成对保存与统一出口。
 
 ### 3.3 从 MinGW 头文件提取 WNDCLASSEXW
 
@@ -131,7 +133,11 @@ x64 下按"每个字段自然对齐"推偏移——指针 8 字节对齐、`UINT
 
 合计 **80 字节**。注意 `cbWndExtra` 占 20～23，`hInstance` 从 24 开始正好 8 字节对齐，因此中间**没有**隐式填充。`common.asm` 中的定义与上表逐项对应，`WNDCLASSEXW_size` 是 NASM 自动生成的后缀常量，值为 80。
 
-`cbSize` 是结构体自描述字段，`RegisterClassExW` 靠它判断你用的是哪个版本的结构体。填错（比如 72 或 76）会直接注册失败。
+`cbSize` 是结构体自描述字段，`RegisterClassExW` 靠它确认调用者提供的布局大小。填错可能导致注册失败；失败时函数返回 0，应先立即保存 `GetLastError` 再诊断。
+
+手工推结构体时，每放一个字段都重复两步：先把当前偏移向上对齐到该字段对齐要求，再放入字段并前进字段大小；最后把整个结构体大小向上对齐到最大字段对齐要求。比如本例前两个 `UINT` 后偏移已经是 8，函数指针无需填充；`cbClsExtra/cbWndExtra` 共 8 字节后偏移是 24，下一指针也自然对齐。`MSG` 在下一章会出现真正的隐式填充。
+
+`hbrBackground = COLOR_WINDOW + 1` 是 Win32 对系统颜色画刷的特殊约定，把颜色索引转换成伪 `HBRUSH`，不是普通地址加一，也不是本章创建的 GDI 对象。因此不要对这个值调用 `DeleteObject`。
 
 ### 3.4 12 参数的 CreateWindowExW
 
@@ -153,7 +159,9 @@ x64 下按"每个字段自然对齐"推偏移——指针 8 字节对齐、`UINT
 12    lpParam            [rsp+88]
 ```
 
-关键规则：即使 C 原型里 `X/Y/Width/Height` 是 `int`（4 字节），x64 调用约定仍按 **8 字节槽**传递，高位写 0 即可。写成 `mov dword [rsp+48], 640` 只写低 4 字节，高 4 字节残留旧值，必须用 `mov qword`。
+关键规则：每个参数位置占一个 **8 字节槽**，但槽位大小不等于 C 类型大小。`X/Y/Width/Height` 仍是 32 位 `int`，被调方按原型读取低 4 字节；源码统一写 `mov qword` 是为了让整个槽内容确定、示例整齐，并非说这些 `int` 被扩展成 64 位值。写 `mov dword [rsp+48],640` 时低 4 字节已经是正确的 640，高 4 字节不属于这个 `int` 的有效值；不过教学上统一写 qword 更容易检查布局，也能避免误把指针句柄只写一半。
+
+另外，`CW_USEDEFAULT = 0x80000000` 对这些坐标参数有系统规定的特殊含义，不应拿它参与普通负数大小比较。窗口实际可见尺寸还会受显示缩放、窗口样式和屏幕工作区影响，`640×480` 是请求的外框尺寸，不一定等于客户区尺寸。
 
 ### 3.5 消息循环与 GetMessageW 的返回值
 
@@ -165,11 +173,33 @@ GetMessageW(&msg, NULL, 0, 0)
       └─ 返回 >0 → 有消息，TranslateMessage → DispatchMessageW
 ```
 
-`test eax, eax` 判 0，`js`（符号位，即负数）判 -1，两条跳转覆盖退出条件。`WM_QUIT` 由 `PostQuitMessage` 产生，通常在 `WM_DESTROY` 里调用。
+`test eax, eax` 判 0，`js`（符号位，即负数）判 -1，两条跳转覆盖退出条件。`WM_QUIT` 由 `PostQuitMessage` 产生，通常在当前线程的 `WM_DESTROY` 处理里调用。
 
-### 3.6 窗口过程的最小写法
+一次普通键盘消息的路径可以拆成：
+
+```text
+GetMessageW 取出 MSG
+  → TranslateMessage 把部分虚拟键消息翻译成 WM_CHAR 等字符消息
+  → DispatchMessageW 根据 MSG.hwnd 找到窗口
+  → 系统以 RCX/RDX/R8/R9 调用该窗口的 WndProc
+  → WndProc 返回
+  → 回到循环再次 GetMessageW
+```
+
+`GetMessageW` 没有消息时会阻塞等待，不是高速空转。`WM_QUIT` 是线程消息，特殊地让 `GetMessageW` 返回 0，**不会再派发给 WndProc**。它的 `wParam` 保存 `PostQuitMessage(exitCode)` 的退出码；本章简化成固定 `xor eax,eax` 返回 0，若需要传播退出码应从 `msg.wParam` 读取。
+
+### 3.6 窗口过程的最小写法与创建期回调
 
 `WndProc` 只需要自己处理关心的消息，其余全部交给 `DefWindowProcW`。本章只处理 `WM_DESTROY`：调用 `PostQuitMessage(0)`，让消息循环退出。`PostQuitMessage` 的参数是退出码，会作为 `WM_QUIT` 的 `wParam`。
+
+一个反直觉但非常重要的细节：**`CreateWindowExW` 返回之前，系统就可能同步调用 `WndProc`**，例如创建和尺寸初始化阶段的消息。此时源码的 `mov [rel hwnd],rax` 尚未执行，全局 `hwnd` 仍是 0。因此在窗口过程中：
+
+- 优先使用系统通过 `RCX` 传入的 `hwnd`，不要假设全局变量已经填好；
+- 若调用其他 API 会覆盖 `RCX`，先把回调参数保存到安全本地槽；
+- 走默认分支时，`RCX/RDX/R8/R9` 必须仍是原始四参数，再 `call DefWindowProcW`；
+- 自己处理并约定返回 0 的消息，应明确 `xor eax,eax`，不要把上一个 API 的偶然返回值带回去。
+
+`ShowWindow` 的返回值表示窗口此前的可见状态，不是简单的成功/失败布尔值；创建窗口后仍应检查 `CreateWindowExW` 的 `HWND`。`UpdateWindow` 在更新区非空时促使窗口绘制，空白窗口即使没有内容，也由此进入正常的绘制生命周期。
 
 ## 4. 实践用例
 
@@ -285,7 +315,7 @@ WndProc:
     call    CreateWindowExW
 ```
 
-回扣知识点 3.4：第 5～12 个参数按 8 字节槽写，必须用 `mov qword`。`.lst` 里 `4889442450` 精确证明了 `[rsp+80]` 的写入。
+回扣知识点 3.4：第 5～12 个参数按 8 字节槽排列，源码统一用 `mov qword` 把整个槽写确定。`int/DWORD` 参数的有效值仍是低 4 字节，指针和句柄则必须保留完整 8 字节。`.lst` 里 `4889442450` 精确证明了 `[rsp+80]` 的写入。
 
 **⑤ 消息循环的双分支退出**
 
@@ -302,7 +332,7 @@ WndProc:
 
 1. **`cbSize` 填成 72 或 76**：`RegisterClassExW` 返回 0，`CreateWindowExW` 也拿不到窗口。这个结构体是 80。
 2. **忘了清零 `WNDCLASSEXW`**：`cbClsExtra/cbWndExtra/lpszMenuName` 里的垃圾值会让注册失败。
-3. **`CreateWindowExW` 的栈参数写成 4 字节**：例如 `mov dword [rsp+48], 640` 只写低 4 字节，高 4 字节是影子空间里的旧值；应写 `mov qword`。
+3. **把槽位宽度和参数类型混为一谈**：每个栈参数槽是 8 字节，但 `int` 参数只读低 4 字节。源码写 qword 是清晰的确定性写法；真正危险的是把 64 位指针或句柄只写低 4 字节，或把参数放错槽位。
 4. **`GetMessageW` 只判断 0**：不判断 -1 时，出错会当成"有消息"继续循环。
 5. **`hbrBackground` 忘了 `+1`**：`COLOR_WINDOW` 是颜色索引，画刷句柄是索引 +1。
 6. **`make clean` 在纯 PowerShell 下失败**：Makefile 的 `clean` 调 `rm`，`make` 直接 `CreateProcess` 找不到 `rm.exe`（只在 MSYS 的 `usr/bin` 里）。在 MSYS2/MinGW 终端里执行没问题；PowerShell 里可手动删除：
@@ -313,7 +343,7 @@ WndProc:
 ## 7. 练习
 
 1. 把窗口尺寸从 640×480 改成 800×600，重新 `make`，在 `.lst` 里找到 `mov qword [rsp + 48], 800` 的机器码。
-2. 在 `WndProc` 里加一句 `cmp edx, WM_CLOSE` 并 `je .on_destroy`，观察点关闭按钮时程序是否直接退出。
+2. 在 `WndProc` 里增加 `WM_CLOSE` 分支并调用 `DestroyWindow`，对照默认处理的路径；不要在尚未销毁窗口时把它直接跳到 `PostQuitMessage`。
 3. 把 `hbrBackground` 改成 0，窗口背景会怎样？为什么第 17 章 D2D 正好需要 0？
 4. 用 `objdump -p firstwindow.exe | Select-String "Subsystem"` 验证 `-mwindows` 的作用；去掉 `-mwindows` 再链接，观察子系统变化和是否弹出控制台。
 5. 在 GDB 里对 `WndProc` 下断点（先 `.\firstwindow.exe` 再附加，或直接 `gdb --args firstwindow.exe`），用 `info registers rcx rdx r8 r9` 确认四个参数。

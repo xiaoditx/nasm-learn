@@ -17,13 +17,13 @@
 跑通后你应该能回答：
 
 - `WM_SIZE` 的 `lParam` 低 16 位和高 16 位各是什么？为什么用 `movzx ecx, ax` 而不是 `mov ecx, eax`？
-- `wsprintfW` 的参数从哪里来？为什么调用前要 `xor eax, eax`？
+- `wsprintfW` 的参数从哪里来？为什么没有容量参数会有风险？
 - `WM_CLOSE`、`WM_DESTROY`、`DestroyWindow`、`PostQuitMessage` 的先后顺序是什么？
 
 ## 2. 前置 / 项目结构
 
 ```text
-masm-learn/
+nasm-learn/
 ├── common.asm                    WNDCLASSEXW / MSG / PAINTSTRUCT 定义
 └── 14-window-messages/
     ├── Makefile
@@ -77,7 +77,7 @@ Windows GUI 是**事件驱动**的：程序不主动轮询输入，而是等待�
 
 **④ 非易失寄存器**
 
-本章 `WndProc` 不碰 `RBX/RDI/RSI/R12~R15`，状态都放全局变量（`g_width`、`g_height`、`g_keys`）。这是有意的取舍：**全局变量比寄存器保存更直观**，也避免初学者在多个 `ret` 分支里漏掉 `pop`。第 15 章会用 `RBX` 演示标准的"改了必须恢复"。
+本章 `WndProc` 不碰 `RBX/RDI/RSI/R12~R15`，状态都放全局变量（`g_width`、`g_height`、`g_keys`）。这是有意的取舍：全局变量比寄存器保存更直观，也避免初学者在多个 `ret` 分支里漏掉 `pop`。但 `wmain` 的 `rep stosd` 仍然修改了 `RDI`，源码没有保存恢复它，和第 13 章一样属于 ABI 瑕疵，不能据此认为“本章完全遵守非易失规则”。第 15 章的 `WndProc` 会用 `RBX` 演示标准的“改了必须恢复”。
 
 ### 3.3 从 MinGW 头文件提取 MSG 与 PAINTSTRUCT
 
@@ -146,7 +146,7 @@ edx == WM_ERASEBKGND?→ .on_erase
 
 ### 3.5 WM_SIZE：从 lParam 拆宽高
 
-`lParam` 是 32 位压缩值：**低 16 位是宽度，高 16 位是高度**。
+在 x64 回调里 `lParam` 寄存器本身是 64 位，但 `WM_SIZE` 协议只把宽高压在它的低 32 位中：**低 16 位是宽度，高 16 位是高度**。因此源码先取 `r9d`，后续只看 `EAX/AX`。
 
 ```text
 lParam (32 bit)
@@ -163,25 +163,41 @@ lParam (32 bit)
 
 如果写成 `mov ecx, eax`，`ecx` 会同时含高 16 位的垃圾，宽度可能变成几百万。
 
-### 3.6 WM_KEYDOWN 与变参函数 wsprintfW
+### 3.6 WM_KEYDOWN、wsprintfW 格式串与缓冲区风险
 
-`wsprintfW(LPWSTR buf, LPCWSTR fmt, ...)` 是变参函数：
+`WM_KEYDOWN` 的 `wParam` 是虚拟键码，例如 ESC 为 `0x1B`、空格为 `0x20`、方向左键为 `0x25`。本章调用等价于：
 
-| 位置 | 参数 | 寄存器 |
+```c
+wsprintfW(title_buf, L"last key: 0x%04X", key);
+```
+
+| 参数槽位 | 实际值 | 放置位置 |
 |---|---|---|
-| 1 | `buf` | `RCX` |
-| 2 | `fmt` | `RDX` |
-| 3 | 第一个可变参数 | `R8` |
+| 1 | 目标缓冲区 `title_buf` | `RCX` |
+| 2 | 格式串 `fmt_key` | `RDX` |
+| 3 | 键码，第一个可变参数 | `R8D` |
 
-变参函数调用前必须 **`AL = 0`**（表示没有浮点参数）。`wsprintfW` 没有 `float`/`double` 参数，所以用 `xor eax, eax` 清零 `AL`。忘记清 `AL` 会破坏变参约定。
+`%04X` 可以拆成三部分：`%` 开始转换，`0` 表示用前导零补齐，`4` 表示**最小**宽度，`X` 表示大写十六进制。键码 `0x1B` 显示为 `001B`；如果数值超过 4 位，宽度 4 不会把它截断。格式串末尾的 0 由 `WSTRZ` 生成。
+
+再次强调：Windows x64 的 `wsprintfW` **不要求 `AL=0`**，那是 System V 变参约定。源码的 `xor eax,eax` 无害但不是必需；真正必须保证的是参数槽位、格式符与参数类型匹配。`wsprintfW` 也不支持安全地处理任意浮点格式化需求，不要把它当完整的 CRT 格式化器。
+
+更重要的是容量：`wsprintfW` 没有目标容量参数，调用者无法通过函数签名阻止溢出，而且它的文档还限制输出上限。本章 `title_buf: resb 128` 只有 **128 字节 = 64 个 UTF-16 码元**，当前固定前缀和键码很短，所以够用；若拼接用户字符串就不能保证安全。更稳妥的接口是 `_snwprintf`：
+
+```c
+int n = _snwprintf(title_buf, 64, L"last key: 0x%04X", key);
+```
+
+这里第二个参数 64 的单位也是码元，不是字节。它最多写入限定数量，返回值小于 0 可表示截断或编码错误；防御性代码还应检查返回值并确保最后一个码元为 0。`wsprintfW` 成功返回的是写入码元数，不含结尾 0，这个返回值在第 15 章会作为 `TextOutW` 的长度。
 
 ### 3.7 WM_PAINT 必须成对
 
 `BeginPaint` 和 `EndPaint` 必须严格配对。`BeginPaint` 返回 `HDC`（设备上下文句柄），即使不用也必须 `EndPaint`，否则窗口会一直处于"等待绘制"状态，CPU 空转重绘。
 
-### 3.8 WM_ERASEBKGND 返回 1
+### 3.8 WM_ERASEBKGND 返回 1 的真实含义
 
-`WM_ERASEBKGND` 是系统在重绘前问"要不要我帮你擦背景"。返回 1 表示"我已经擦过了，不用系统擦"，可以减少闪烁。本章其实没真正擦背景（背景刷由系统负责），但返回 1 能避免系统重复擦除。
+`WM_ERASEBKGND` 是系统在重绘前询问是否应由应用处理背景擦除。返回非零表示“背景已经处理，不再让默认流程擦”，常用于真正由程序完整填充背景的绘制方案，以减少闪烁。
+
+**本章实际上没有擦背景，`WM_PAINT` 也只配对 BeginPaint/EndPaint，没有填充客户区。** 因此 `.on_erase` 返回 1 只是消息分支演示，不是一个完整的防闪烁模板，可能留下旧内容或透明区域。若希望系统类背景刷参与，可返回 0 或不处理该消息并交给 `DefWindowProcW`；若返回 1，就应在自己的绘制代码中覆盖需要更新的区域。
 
 ### 3.9 窗口关闭的生命周期
 
@@ -198,7 +214,7 @@ WM_CLOSE ──► DestroyWindow ──► WM_DESTROY ──► PostQuitMessage(
                                                     进程退出
 ```
 
-`WM_CLOSE` 的默认处理就是 `DestroyWindow`。本章把它显式写出来，是为了让你看到完整的生命周期。正确顺序是：`WM_CLOSE` → `DestroyWindow`（不要直接 `PostQuitMessage`，否则窗口句柄泄漏）。
+`WM_CLOSE` 的默认处理就是 `DestroyWindow`。本章把它显式写出来，是为了让你看到完整的生命周期。正确顺序是：`WM_CLOSE` → `DestroyWindow` → `WM_DESTROY` → `PostQuitMessage`。直接在 `WM_CLOSE` 里 `PostQuitMessage` 会绕过窗口销毁及你在 `WM_DESTROY` 中安排的清理；进程最终退出时系统虽会回收内核资源，但应用级状态和保存逻辑可能没机会执行，因此不要把它当标准关闭流程。
 
 ## 4. 实践用例
 
@@ -261,7 +277,7 @@ GUI 子系统，导入 `USER32.dll`。**只编译不运行**。手动体验：`.
 
 `0FB7C8` = `movzx ecx, ax`：`0F B7` 是 16→32 位零扩展，ModRM `C8` 表示 `ECX <- AX`。
 
-**变参函数前置**：
+**格式化调用前的清零指令（不是 Windows 的 AL 要求）**：
 
 ```text
    110 00000082 31C0                        xor     eax, eax
@@ -309,7 +325,7 @@ GUI 子系统，导入 `USER32.dll`。**只编译不运行**。手动体验：`.
 
 回扣知识点 3.5：`movzx` 零扩展避免高位垃圾。如果改成 `mov ecx, eax`，宽度会包含高 16 位。
 
-**③ wsprintfW 的变参前置**
+**③ wsprintfW 的参数槽位与容量**
 
 ```asm
     lea     rcx, [rel title_buf]
@@ -319,7 +335,7 @@ GUI 子系统，导入 `USER32.dll`。**只编译不运行**。手动体验：`.
     call    wsprintfW
 ```
 
-回扣知识点 3.6：变参函数前 `AL = 0`。`r8d` 是 `WM_KEYDOWN` 的虚拟键码，格式串 `%04X` 消费它。
+回扣知识点 3.6：`r8d` 是 `WM_KEYDOWN` 的虚拟键码，位于第三个参数槽，格式串 `%04X` 消费它。`xor eax,eax` 不是 Windows ABI 的必要条件；需要重点检查的是 64 码元目标容量和格式参数匹配。
 
 **④ BeginPaint / EndPaint 配对**
 
@@ -350,8 +366,8 @@ GUI 子系统，导入 `USER32.dll`。**只编译不运行**。手动体验：`.
 ## 6. 常见坑
 
 1. **`mov ecx, eax` 取宽高**：高 16 位没清掉，宽度可能变成几百万。
-2. **`wsprintfW` 前没清 `AL`**：变参约定被破坏。
-3. **`WM_CLOSE` 里直接 `PostQuitMessage`**：窗口没销毁就退出，句柄泄漏；正确做法是 `DestroyWindow`。
+2. **只背 `AL=0` 却忽略缓冲区容量**：Windows x64 不要求这个 `AL` 设置；`wsprintfW` 没有容量参数才是本章真正的安全风险。固定短文本可演示，通用输入应改用带容量的格式化函数并检查截断。
+3. **`WM_CLOSE` 里直接 `PostQuitMessage`**：会跳过 `DestroyWindow/WM_DESTROY` 及应用清理流程；正确做法是 `DestroyWindow`，再在 `WM_DESTROY` 中投递退出消息。
 4. **`BeginPaint` 没有 `EndPaint`**：窗口永远"脏"，CPU 空转重绘。
 5. **`DefWindowProcW` 前破坏了 `RCX/RDX/R8/R9`**：必须原样传进去，别在中间插入别的调用。
 6. **`make clean` 依赖 `rm`**：纯 PowerShell 下 `make` 找不到 `rm.exe`，改用 `Remove-Item winproc.exe,winproc.obj,winproc.obj.lst`。

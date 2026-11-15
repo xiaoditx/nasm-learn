@@ -27,12 +27,12 @@
 
 ## 2. 前置 / 项目结构
 
-阶段零的知识全部是本章的前置：`default rel`（第 03 章）、`push rbp / mov rbp, rsp / sub rsp, N`（第 05 章）、`lea rcx, [rel label]`（第 02~03 章）。
+本章真正需要的前置是：`default rel` 与 `[rel label]` 的基本写法（第 00 章引入，第 02 章继续练习）、`lea` 取地址（第 02～03 章），以及栈帧序言 `push rbp / mov rbp, rsp / sub rsp, N`（第 05 章）。第 04 章的旧式 16 位代码迁移是选读，不影响本章。
 
 ```text
-masm-learn/
+nasm-learn/
 ├── common.asm                共享常量与宏（只有预处理指令）
-└── rebuild/06-crt-makefile/
+└── 06-crt-makefile/
     ├── Makefile
     ├── hello_wmain.asm
     ├── README.md
@@ -100,7 +100,7 @@ msg_args: WSTR "wmain received %d argument(s)"
 
 ### 3.3 Windows x64 ABI 四件套
 
-这一节后面每章都会重复，因为它是所有崩溃的根源。
+这里集中学习完整规则；后续章节只回顾当前调用需要的部分，不再把整套规则当作新知识重复讲解。
 
 #### 3.3.1 前四个参数：RCX / RDX / R8 / R9
 
@@ -154,11 +154,28 @@ sub rsp, 32          ; 影子空间
 
 本章 `wmain` 只动 `RAX/RCX/RDX`，都属于易失寄存器，因此除了 `RBP` 之外没有额外保存。
 
-### 3.4 变参函数与 `AL`
+### 3.4 Windows 变参函数：按“槽位”传参，不看 `AL`
 
-`wprintf` 是变参函数，格式串在 `RCX`，可变参数依次放 `RDX`、`R8`、`R9`、`[rsp+32]`……。
+`wprintf` 是变参函数，也就是参数个数由格式串决定的函数：
 
-调用变参函数前必须把 **`AL` 清零**，表示"没有浮点参数"。这是 System V 和 Windows x64 ABI 共有的约定：`AL` 告诉被调方有多少个向量寄存器（`XMM0~XMM5`）里装了浮点参数。本章用 `xor eax, eax` 同时清零 `EAX`（也就清零了 `AL`）。
+```c
+int wprintf(const wchar_t *format, ...);
+```
+
+本章第一次调用等价于 `wprintf(msg_args, argc)`。它总共两个参数，所以映射非常直接：
+
+| 参数槽位 | 实际值 | 调用前放置位置 |
+|---|---|---|
+| 固定参数 `format` | `msg_args` 的地址 | `RCX` |
+| 第一个可变参数 | `argc`，32 位 `int` | `EDX` |
+
+如果格式串里还有第二、第三个转换项，就继续使用 `R8`、`R9`；第五个参数槽才放到 `[rsp+32]`。**参数槽位由参数位置决定，不由格式符的字符个数决定。**
+
+必须特别纠正一个常见混淆：**Windows x64 不使用 `AL` 记录浮点参数数量**。`AL = XMM 寄存器参数个数` 是 Linux/macOS 常见 System V AMD64 ABI 的变参规则，不能套到本章。Windows x64 对变参函数中的浮点参数采用“同一个值同时放对应 XMM 和整数寄存器槽”的规则；本章只有整数参数，不涉及这种双写。
+
+源码在 `call wprintf` 前保留 `xor eax, eax`，只是把 `RAX` 清零，**不是 Windows ABI 的必需步骤**，可以把它理解为演示代码留下的无害指令。最后 `wmain` 返回前的 `xor eax, eax` 则确实有必要，因为它把返回值设为 0；两处指令相同，目的不同。
+
+还要区分“参数已经放好”和“格式串是否匹配”：ABI 只负责把值送到约定位置。若格式串写 `%d`，就必须提供兼容的 32 位整数；若写 `%p`，就应提供指针宽度的值。类型不匹配不会由 NASM 自动发现。
 
 ### 3.5 Makefile 基础
 
@@ -199,13 +216,39 @@ clean:
 - `$(OBJS:.obj=.obj.lst)` 把 `hello_wmain.obj` 变成 `hello_wmain.obj.lst`，供 `clean` 删除；
 - `.PHONY` 声明 `all/run/clean` 不是真实文件。
 
+### 3.6 第一次执行 make 时究竟发生了什么
+
+`make` 不是编程语言解释器在“运行 exe”，它先根据目标和依赖构造一张更新图。首次构建时：
+
+```text
+all
+ └─ hello_wmain.exe
+     └─ hello_wmain.obj
+         ├─ hello_wmain.asm
+         └─ ../common.asm
+```
+
+因为 `.exe` 不存在，`make` 先发现需要 `.obj`；`.obj` 也不存在，于是执行模式规则中的 NASM 命令。此时自动变量展开为：
+
+```text
+$@ = hello_wmain.obj       当前规则要生成的目标
+$< = hello_wmain.asm       第一个依赖
+$^ = hello_wmain.asm ../common.asm
+```
+
+生成 `.obj` 后再回到 EXE 规则：`$@ = hello_wmain.exe`，`$^ = hello_wmain.obj`，所以链接命令变成 `gcc -municode -o hello_wmain.exe hello_wmain.obj`。
+
+第二次立刻执行 `make`，若目标比所有依赖都新，就会显示“无需处理”或类似提示，而不是机械地重编。修改 `common.asm` 后它的时间戳比三个章节的对象文件新，依赖它的对象才会重建。可以用 `make -n` 只显示将执行的命令，用 `make clean` 删除生成物后强制走一遍完整流程。
+
+Makefile 的配方行必须以 **Tab** 开头，不能用四个空格代替；这是初学者手写 Makefile 时最常见的语法错误之一。
+
 ## 4. 实践用例
 
 打开 [hello_wmain.asm](hello_wmain.asm)。程序打印 `argc` 和三行宽字符串，返回 0 作为退出码。
 
 ### 4.1 构建与运行
 
-在 `rebuild/06-crt-makefile` 目录下：
+在 `06-crt-makefile` 目录下：
 
 ```powershell
 make
@@ -307,7 +350,7 @@ GDB 在这里是**指令级**：`si` 单步一条指令，`disas` 看反汇编�
 
 3. **`lea rcx, [rel msg_args]`（RIP 相对寻址）**：`default rel` 让标签默认按 RIP 相对寻址。`lea` 只算地址不访问内存，比 `mov rcx, msg_args` 更符合 PIC 习惯。
 
-4. **`xor eax, eax` 清 `AL`（知识点 3.4）**：`wprintf` 是变参函数，`AL` 必须等于浮点参数个数（这里是 0）。`xor eax, eax` 同时把整个 `EAX` 清零，副作用为零。
+4. **调用前的 `xor eax, eax` 不是 Windows 的 `AL` 要求（知识点 3.4）**：它只是清零 `RAX`，对本章整数版 `wprintf` 调用无害但非必需。不要把它背成 Windows 变参规则；最后返回前的同一指令才是设置 `wmain` 返回值 0。
 
 5. **`xor eax, eax / leave / ret`**：`wmain` 的返回值就是进程退出码。`leave` = `mov rsp, rbp` + `pop rbp`，然后 `ret` 回到 CRT，CRT 会把返回值传给 `ExitProcess`。返回 0 表示成功。
 
@@ -316,7 +359,7 @@ GDB 在这里是**指令级**：`si` 单步一条指令，`disas` 看反汇编�
 ## 6. 常见坑
 
 1. **忘了 `-municode`**：CRT 找 `main`，链接报 `undefined reference to WinMain`。
-2. **调用 `wprintf` 前没清 `AL`**：变参函数约定 `AL` = 浮点参数个数。不清零可能读到垃圾 XMM 状态。
+2. **把 System V 的 `AL` 规则搬到 Windows**：Windows x64 的 `wprintf` 不要求调用前设置 `AL`。真正容易出错的是格式符与参数类型不匹配、槽位顺序错误、栈未对齐或影子空间不足。
 3. **`WSTR` 后忘记补 `dw 0`**：下一段数据会被当成字符串的一部分。要么用 `WSTRZ`，要么紧跟 `dw 10, 0`。
 4. **本地槽放进影子空间**：`sub rsp, 32` 时 `[rbp-8]` 正好在影子空间里，`call` 会覆盖它。要么把槽放在更高的地址（`[rbp-8]` 之上？不，`[rbp-8]` 已经在 `sub rsp,32` 的范围内）。正确做法是额外分配，例如 `sub rsp, 48`，让影子空间位于 `rsp..rsp+31`，本地槽位于 `rbp-16..rbp-1` 之类。第 07 章会实际演示这个坑。
 5. **`make clean` 把 `.lst` 删了**：`.lst` 是生成物，需要时重新 `make`。

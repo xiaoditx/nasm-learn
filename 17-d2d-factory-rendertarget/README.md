@@ -17,14 +17,14 @@
 跑通后你应该能回答：
 
 - `D2D1CreateFactory` 的 4 个参数各是什么？
-- 为什么 `rt_props` 全部填 0 就是"默认硬件渲染"？
+- 为什么 `rt_props` 全部填 0 表示默认配置，却不保证一定走硬件渲染？
 - 槽 14 和 `0x70` 是什么关系？
 - `Clear` 的参数为什么是 `D2D1_COLOR_F*` 而不是 `COLORREF`？
 
 ## 2. 前置 / 项目结构
 
 ```text
-masm-learn/
+nasm-learn/
 ├── common.asm                      D2D 结构体、COM_CALL、槽位常量
 └── 17-d2d-factory-rendertarget/
     ├── Makefile
@@ -55,7 +55,9 @@ ID2D1HwndRenderTarget     窗口渲染目标（绑定 HWND，执行绘制）
 画刷 / 几何图形等资源     （第 18 章）
 ```
 
-工厂是线程级的单例，渲染目标绑定具体窗口。释放顺序是"先子后父"：渲染目标 → 工厂。
+工厂**不是线程级单例**：每次成功调用 `D2D1CreateFactory` 都会向调用者返回一个工厂接口引用，程序可以创建多个工厂。`SINGLE_THREADED` 描述的是该工厂及其派生资源的线程使用约定，不是“全线程只能存在一个工厂”。
+
+渲染目标绑定具体窗口和设备相关资源。程序应在不再使用派生资源后，按“先子后父”的顺序清理：画刷等资源 → 渲染目标 → 工厂。这是清晰的资源依赖顺序；每个 COM 接口仍按自己的引用计数独立释放，不能笼统地说“先释放工厂就必然让子对象内部指针失效”。
 
 ### 3.2 Windows x64 ABI 四件套
 
@@ -89,7 +91,9 @@ R9  = &p_rt
 
 **④ 非易失寄存器**
 
-本章所有状态都放在 `.bss` 全局变量里（`p_factory`、`p_rt`），`WndProc` 不碰非易失寄存器，因此只有 `push rbp / leave`。`COM_CALL` 只破坏 `RAX`——它是易失寄存器，调用者不需要保存。
+`WndProc` 把状态放在 `.bss` 全局变量里（`p_factory`、`p_rt`），除帧指针 `RBP` 外不修改其他非易失寄存器。`COM_CALL` 本身用 `RAX` 查虚表，`RAX` 是易失寄存器；被调用的方法也必须按 ABI 保住非易失寄存器。
+
+但 **`wmain` 并不满足“完全不碰非易失寄存器”**：它两次用 `lea rdi,...; rep stosd` 清零结构体，`RDI` 会被修改却没有保存恢复。这与第 13～15 章的同类问题一样，是当前源码的 ABI 瑕疵，不应复制到通用函数。可保存恢复 `RDI`，或改用易失寄存器配合显式清零。
 
 ### 3.3 从 MinGW 头文件提取 D2D 结构体
 
@@ -119,7 +123,7 @@ typedef struct D2D1_RENDER_TARGET_PROPERTIES {
 | `minLevel` | 24 | 4 |
 | 合计 | | **28** |
 
-全部填 0 的含义：`type=0`（默认，自动选硬件/软件）、`format=0`（`DXGI_FORMAT_UNKNOWN`，由系统决定）、`dpi=0`（用系统 DPI）、`usage=0`、`minLevel=0`。这就是"默认硬件渲染"。
+全部填 0 的含义：`type=0`（`DEFAULT`，由 Direct2D 选择硬件或软件实现）、`format=0`（`DXGI_FORMAT_UNKNOWN`，由系统决定）、`dpiX/dpiY=0`（使用默认桌面显示密度，下一小节解释）、`usage=0`、`minLevel=0`。准确说法是“**默认渲染目标配置**”，不是保证一定使用硬件渲染；硬件不可用或配置不支持时可能使用软件路径。
 
 **D2D1_HWND_RENDER_TARGET_PROPERTIES**（`d2d1.h` 约 420 行）：
 
@@ -148,7 +152,32 @@ typedef struct D2D1_COLOR_F {
 } D2D1_COLOR_F;
 ```
 
-4 个 `FLOAT`，16 字节。用 `istruc` 在 `.data` 里直接初始化，`dd 0.12` 会写成 IEEE-754 单精度位模式。
+4 个 `FLOAT`，16 字节，每个通道通常位于 `0.0～1.0`，顺序是 **R、G、B、A**，与 GDI 的整数 `0x00BBGGRR` 完全不同。`A` 是 alpha，表示不透明度：`1.0` 为完全不透明，`0.0` 为完全透明；具体透明效果还取决于渲染目标和合成场景，不能把 HWND 当成自动支持透明窗口。
+
+用 `istruc` 在 `.data` 里初始化时，`dd 0.12` 写的是 IEEE-754 二进制32位浮点位模式，不是整数 `0` 或 `12`。例如：
+
+```asm
+dd 1.0    ; 数值位模式 0x3F800000，内存字节 00 00 80 3F
+dd 0.5    ; 数值位模式 0x3F000000，内存字节 00 00 00 3F
+dd 1      ; 整数位模式 0x00000001；当成 FLOAT 读取时不是 1.0
+```
+
+以 `1.0` 为例：符号位为 0，指数为 127（即 `0x7F`），尾数有效位为 0，拼成 `0 01111111 00000000000000000000000`，就是 `0x3F800000`。目前不必手算每个小数，但必须区分 `dd 1.0` 和 `dd 1`。
+
+#### 3.3.1 像素与 DIP：两套单位不要混写
+
+`hwnd_props.pixelSize` 使用**物理像素**，与窗口客户区的像素尺寸对应；后续 `FillRectangle`、坐标、半径等 Direct2D 绘图值通常使用 **DIP**（device-independent pixel，设备无关像素）。**DPI**（dots per inch）在这里表示显示缩放密度，96 DPI 是本节换算的基准。
+
+换算关系是：
+
+```text
+物理像素 = DIP × DPI / 96
+DIP      = 物理像素 × 96 / DPI
+```
+
+在 96 DPI 下，100 DIP = 100 像素；在 144 DPI 下，缩放倍率为 `144/96=1.5`，所以 100 DIP = 150 像素。
+
+本章 `Clear` 没有坐标参数，因此暂时不用传 DIP；但 `pixelSize.width=640`、`pixelSize.height=480` 仍是像素。另一个现实限制是：`CreateWindowExW` 的 640×480 是**整个窗口**的初始尺寸，包含标题栏和边框，不等于客户区恰好 640×480。本章源码又把这两个值直接用于渲染目标，且没有处理后续 `WM_SIZE/Resize`，所以尺寸并不严格同步；第 19 章改为在 `WM_SIZE` 中从 `lParam` 取出客户区宽高，再调用 `Resize`。`GetClientRect` 是另一种常见的客户区尺寸获取方式。
 
 ### 3.4 数虚表槽位
 
@@ -189,16 +218,18 @@ typedef struct ID2D1FactoryVtbl {
 | 48 | `BeginDraw` | `0x180` |
 | 49 | `EndDraw` | `0x188` |
 
-`ID2D1HwndRenderTargetVtbl` 在基类 57 槽（0～56）之后追加 `Resize`（槽 58，第 19 章用）。
+`ID2D1RenderTarget` 基接口占 57 个槽（0～56）。`ID2D1HwndRenderTarget` 随后先追加 `CheckWindowState`（槽 57），再追加 `Resize`（槽 58，第 19 章用）。数槽时不能漏掉中间的 `CheckWindowState`，否则会把 `Resize` 错算成 57。
 
 ### 3.5 D2D1CreateFactory
 
 `D2D1CreateFactory(factoryType, riid, pFactoryOptions, ppIFactory)`：
 
-- `factoryType`：`D2D1_FACTORY_TYPE_SINGLE_THREADED=0`，单线程工厂足够给一个窗口用；多线程工厂每调用一次都要加锁；
-- `riid`：`IID_ID2D1Factory`；
+- `factoryType`：`D2D1_FACTORY_TYPE_SINGLE_THREADED=0`，表示只从单线程访问工厂及其派生资源，不为多线程并发访问提供内部同步；`MULTI_THREADED` 则允许受支持的多线程使用，但会有同步开销；
+- `riid`：`IID_ID2D1Factory`，说明输出接口类型；
 - `pFactoryOptions`：传 `NULL` 用默认选项；
-- `ppIFactory`：输出工厂指针。
+- `ppIFactory`：输出工厂接口指针变量的地址，本例为 `&p_factory`。
+
+成功后返回 `S_OK` 并取得一个需要 `Release` 的工厂引用。Direct2D 使用 COM 接口和调用约定，但这个创建流程不要求像第 16 章那样先调用 `CoInitializeEx`；“采用 COM ABI”不等于“所有库的初始化函数都相同”。
 
 ### 3.6 渲染目标的绘制流程
 
@@ -218,7 +249,39 @@ Clear(&D2D1_COLOR_F)           槽 47，用纯色清屏
 EndDraw(NULL, NULL)            槽 49，结束帧并呈现
 ```
 
-`BeginDraw` 和 `EndDraw` 必须成对；`EndDraw()` 的两个参数是 `D2D1_TAG*`，可传 `NULL`。`Clear` 的参数是 `D2D1_COLOR_F*`（RGBA 浮点颜色），不是 GDI 的 `COLORREF`。
+三个方法的汇编参数和返回值并不相同：
+
+| 方法 | 参数 | 返回 |
+|---|---|---|
+| `BeginDraw` | `RCX=this` | `void`，不把 `EAX` 当 `HRESULT` |
+| `Clear` | `RCX=this、RDX=&D2D1_COLOR_F` | `void` |
+| `EndDraw` | `RCX=this、RDX=tag1 或 NULL、R8=tag2 或 NULL` | `EAX=HRESULT` |
+
+`EndDraw` 的两个可选输出参数用于接收绘图诊断标签，本章都传 `NULL`。`Clear` 接受 RGBA 浮点颜色结构的地址，不是 GDI 的整数 `COLORREF`。
+
+#### 3.6.1 BeginDraw/EndDraw 不等于 BeginPaint/EndPaint
+
+这两组名字很像，但层级不同：
+
+- `BeginDraw/EndDraw` 是 **Direct2D 帧边界**，管理渲染目标的绘制与呈现；
+- `BeginPaint/EndPaint` 是 **Win32 WM_PAINT 边界**，取得绘制信息并把窗口更新区域标记为有效。
+
+只调用 D2D 的 `BeginDraw/EndDraw`，不会自动完成 Win32 的 `BeginPaint/EndPaint` 语义。当前源码在 `WM_PAINT` 中没有调用后者，也没有 `ValidateRect`，`p_rt==NULL` 时甚至直接返回；它是只突出 D2D 槽位的简化示例，不是完整的消息处理模板。通用结构应先处理 Win32 绘制边界，再在其中执行 D2D 帧，或按窗口逻辑明确验证更新区域，避免更新区一直无效而反复请求绘制。
+
+#### 3.6.2 EndDraw 的 HRESULT 与设备丢失
+
+`EndDraw` 可能失败，其中 `D2DERR_RECREATE_TARGET=0x8899000C` 表示当前渲染目标相关的设备资源需要重建。显示设备重置、驱动状态变化等情况都可能让旧目标不能继续使用。通用处理流程是：
+
+```text
+EndDraw 返回 D2DERR_RECREATE_TARGET
+    → 停止使用旧渲染目标
+    → Release 画刷、位图等依赖该目标的资源
+    → Release 旧渲染目标并清空全局指针
+    → 用仍有效的工厂重新创建渲染目标及设备相关资源
+    → 下一帧重新绘制
+```
+
+工厂与渲染目标的生命周期不同，通常不需要因为这一个错误就把整个进程退出。本章源码忽略了 `EndDraw` 返回值，也没有重建路径；第 19 章会继续讨论 Resize 和资源重建。学习本章时至少要能识别：“`BeginDraw/EndDraw` 成对”并不包含“所有错误都已处理”。
 
 ## 4. 实践用例
 
@@ -327,7 +390,7 @@ GUI 子系统，导入 `d2d1.dll`（Direct2D）和 `USER32.dll`。**只编译不
     rep     stosd
 ```
 
-回扣知识点 3.3：28/4 = 7 个 dword，24/4 = 6 个 dword。`rep stosd` 一次清零整个结构体。`rt_props` 全 0 就是"默认硬件渲染"。
+回扣知识点 3.3：28/4 = 7 个 dword，24/4 = 6 个 dword。`rep stosd` 一次清零整个结构体，`rt_props` 全 0 表示默认配置，由 Direct2D 选择实现。还要注意 `RDI` 会随 `stosd` 改变；当前 `wmain` 未保存它，是源码中的非易失寄存器瑕疵。
 
 **③ 创建渲染目标（槽 14）**
 
@@ -357,7 +420,7 @@ GUI 子系统，导入 `d2d1.dll`（Direct2D）和 `USER32.dll`。**只编译不
     COM_CALL rcx, RT_END_DRAW                ; 槽 49
 ```
 
-回扣知识点 3.6：`BeginDraw`/`EndDraw` 成对，`Clear` 参数是 `D2D1_COLOR_F*`。`.lst` 里三个偏移 `0x180/0x178/0x188` 对应槽 48/47/49。
+回扣知识点 3.6：`BeginDraw`/`EndDraw` 成对，`Clear` 参数是 `D2D1_COLOR_F*`。`.lst` 里三个偏移 `0x180/0x178/0x188` 对应槽 48/47/49。只有 `EndDraw` 在这里返回需要检查的 `HRESULT`；当前源码未检查，也未处理 `D2DERR_RECREATE_TARGET`。此外，D2D 帧边界不能替代 Win32 的 `BeginPaint/EndPaint`。
 
 **⑤ 释放顺序**
 
@@ -371,23 +434,28 @@ GUI 子系统，导入 `d2d1.dll`（Direct2D）和 `USER32.dll`。**只编译不
     COM_CALL rcx, IUNKNOWN_RELEASE
 ```
 
-回扣知识点 3.1：先释放渲染目标，再释放工厂，最后 `PostQuitMessage`。顺序反了不会立刻崩，但会让 `p_rt` 持有已失效的工厂引用。
+回扣知识点 3.1：这里按“渲染目标 → 工厂”的依赖顺序清理，并把全局指针清零，最后 `PostQuitMessage`。每个接口都只对自己的成功引用调用一次槽 2；不要把清理顺序解释成“父对象 Release 后子对象一定立即悬空”。
+
+当前 `.fail_d2d` 失败出口只返回退出码 3，没有统一释放已经创建的工厂、渲染目标或窗口。短进程退出时系统会回收进程资源，但通用程序仍应使用统一清理路径，尤其当代码被嵌入长期运行的程序时。
 
 ## 6. 常见坑
 
-1. **`rt_props` 没有清零**：`type/usage/minLevel` 里是垃圾值，`CreateHwndRenderTarget` 返回 `E_INVALIDARG`。
-2. **`pixelSize` 与窗口客户区不一致**：图像被拉伸；窗口一创建就 `WM_SIZE`，可以用实际宽高（第 19 章会做）。
-3. **工厂创建失败却继续调用**：`p_factory = NULL`，`COM_CALL` 会在 `mov rax, [rcx]` 时访问 0 地址崩溃。必须 `test eax, eax` / `jnz .fail_d2d`。
-4. **`WM_PAINT` 里没有 `p_rt` 判空**：窗口销毁后再收到重绘会崩。
-5. **忘了 `-ld2d1`**：链接报 `undefined reference to D2D1CreateFactory`。
-6. **把 `Clear` 当成 `FillRectangle`**：`Clear` 不接受画刷，参数是 `D2D1_COLOR_F*`。
-7. **`make clean` 依赖 `rm`**：PowerShell 下用 `Remove-Item d2d_target.exe,d2d_target.obj,d2d_target.obj.lst`。
+1. **`rt_props` 没有初始化**：枚举、浮点和格式字段会是不可预测的值，创建可能失败或产生非预期配置。全 0 是本章明确选择的默认配置，不是“内存天生为 0”。
+2. **把窗口外部尺寸当客户区像素尺寸**：`CreateWindowExW` 的 640×480 包含非客户区；本章硬编码的渲染目标尺寸并不严格等于客户区，后续还需要 `GetClientRect` 与 `Resize`。
+3. **工厂创建失败却继续调用**：`p_factory` 可能仍为 NULL，`COM_CALL` 会在 `mov rax,[rcx]` 时访问空地址。先检查 `HRESULT`，再检查输出。通用 `HRESULT` 模板用 `test eax,eax; js .fail`；源码的 `jnz` 只适合这里明确以 `S_OK=0` 为唯一成功结果的调用，不是通用判断宏。
+4. **忘记 `p_rt` 判空**：窗口创建期间、D2D 初始化失败或资源释放后都可能收到消息。当前源码已有判空，但空路径还没有处理 Win32 更新区验证。
+5. **只用 D2D 的 BeginDraw/EndDraw 处理 WM_PAINT**：它不会自动替代 `BeginPaint/EndPaint` 或 `ValidateRect`，当前示例省略了这一层。
+6. **忽略 EndDraw 的设备丢失**：`D2DERR_RECREATE_TARGET` 需要释放并重建渲染目标及设备相关资源，不能只把窗口关掉。
+7. **把 DIP 当物理像素**：`pixelSize` 用像素，后续图形坐标通常用 DIP；DPI 缩放时两者不再一一相等。
+8. **把 `dd 1` 当浮点 `1.0`**：前者位模式是整数值 1，后者才是 `0x3F800000`。
+9. **忘了 `-ld2d1`**：链接报 `undefined reference to D2D1CreateFactory`。
+10. **`make clean` 依赖 `rm`**：PowerShell 下用 `Remove-Item d2d_target.exe,d2d_target.obj,d2d_target.obj.lst`。
 
 ## 7. 练习
 
 1. 把 `rt_props.type` 改成 `D2D1_RENDER_TARGET_TYPE_SOFTWARE`（2），重新编译。运行时画面还在吗？（软件渲染只是换实现，仍然可见。）
 2. 在 `WM_SIZE` 里打印 `g_width/g_height`，和 `pixelSize` 比较，确认窗口创建时的初始值。
-3. 把 `Clear` 颜色改成 `(1.0, 0, 0, 1.0)` 全红，观察 alpha 参数是否影响窗口（HWND 渲染目标忽略 alpha）。
+3. 把 `Clear` 颜色改成 `(1.0, 0.0, 0.0, 1.0)` 全红，再分别改 RGB 通道并观察结果。alpha 的效果取决于渲染目标和合成方式，不要假设普通 HWND 因此就变成透明窗口。
 4. 在 `.lst` 里找 `mov ecx, D2D1_RENDER_TARGET_PROPERTIES_size / 4`，确认立即数是 7。
 5. 用 GDB 在 `call qword [rax + 0x70]` 前 `si`，`info registers rax rcx rdx r8`，`x/4gx $rax` 查看工厂虚表。
 

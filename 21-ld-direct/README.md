@@ -26,8 +26,10 @@
 
 ## 2. 前置 / 项目结构
 
+前置：第 20 章的 `_start`、系统 API 调用和退出流程。本章保持源码功能不变，只替换链接方式。
+
 ```text
-masm-learn/
+nasm-learn/
 ├── common.asm              与第 20 章相同
 └── 21-ld-direct/
     ├── Makefile            LD := ld，直接链接
@@ -47,7 +49,7 @@ masm-learn/
 1. **参数**：`RCX / RDX / R8 / R9`，第 5 个起走栈（`[rsp+32]`，`qword`）。
 2. **影子空间**：调用前必须备 32 字节；本章 `sub rsp, 40`（= 32 影子 + 8 栈参槽）。
 3. **对齐**：入口 `RSP % 16 == 8`；减 40 后 `% 16 == 0`，之后每个 `call` 点保持。
-4. **非易失寄存器**：`RBX/RBP/RDI/RSI/R12~R15/XMM6~15` 被调方必须保；`_start` 无调用者，可自由使用（本章用 `RBX/RSI`）。
+4. **非易失寄存器**：`RBX/RBP/RDI/RSI/R12~R15/XMM6~15` 是普通被调方必须保存的寄存器。本章 `_start` 最终调用 `ExitProcess`，不会返回后继续执行调用者代码，因此这里使用 `RBX/RSI` 后不恢复；普通函数不能照抄这种简化。
 
 ### 3.2 gcc 驱动原来替我们做了多少事
 
@@ -110,7 +112,7 @@ ld -e _start --subsystem console -o lddirect.exe lddirect.obj -L C:/msys64/ucrt6
 | `--subsystem` | PE 头值 | 效果 |
 |---|---|---|
 | `console` | 3 (Windows CUI) | 从控制台启动就复用该控制台；从资源管理器启动会自动附一个控制台窗口 |
-| `windows` | 2 (Windows GUI) | 不分配控制台；标准句柄可能无效（第 22 章） |
+| `windows` | 2 (Windows GUI) | 不自动分配控制台；标准句柄是否存在取决于继承与启动环境（第 22 章） |
 
 ### 3.4 汇编器留洞，链接器填
 
@@ -203,7 +205,7 @@ start address 0x0000000140001000
 1. **`cannot find -lkernel32`**：忘了 `-L C:/msys64/ucrt64/lib`。ld 的内置搜索路径不含 MinGW 导入库目录。
 2. **`-e` 写成 `--entry=_start` 以外的错拼**：`--entry` 也合法；但 `-e_main`、`-e start` 都会静默指错位置，用 `objdump -f` 核对 `start address`。
 3. **把 `libkernel32.a` 当静态库**：它只是导入库；真正的实现在 `C:\Windows\System32\KERNEL32.dll`。
-4. **子系统写错**：GUI 程序链成 console，启动时会多闪一个控制台窗口；console 程序链成 windows，输出全丢（`GetStdHandle` 返回无效句柄）。
+4. **子系统写错**：GUI 程序链成 console，启动时可能多一个控制台窗口；console 程序链成 windows 则不会自动分配控制台，输出是否仍可见还取决于继承句柄与写出方式。
 5. **库顺序**：`ld` 按顺序扫描，`-lkernel32` 要放在引用它的 `.obj` **之后**（本章命令的顺序）。
 6. **以为 `ld` 认得 gcc 的 `-municode/-mwindows`**：那是 gcc 驱动层的选项，ld 不认识；对应物是 `--subsystem windows`。
 7. **`make clean` 依赖 `rm`**：PowerShell 下用 `Remove-Item lddirect.exe,lddirect.obj,lddirect.obj.lst`。

@@ -24,7 +24,7 @@
 ## 2. 前置 / 项目结构
 
 ```text
-masm-learn/
+nasm-learn/
 ├── common.asm                    WNDCLASSEXW / MSG / PAINTSTRUCT / RECT
 └── 15-gdi-paint/
     ├── Makefile
@@ -54,7 +54,39 @@ TextOutW / FillRect / FrameRect ...  （用 HDC 画图）
 EndPaint(hwnd, &ps)    ──► 释放 HDC，宣告绘制完成
 ```
 
-`HDC` 是绘图的"画布句柄"，所有 GDI 函数都需要它。`BeginPaint` 返回的 `HDC` 只在 `BeginPaint`/`EndPaint` 之间有效。
+`HDC`（Device Context Handle，设备上下文句柄）可以理解为一次绘图所用的“上下文标识”：它关联目标表面以及当前文字颜色、背景模式、画刷等状态。它**不是一块可以直接用 `mov rax, [hdc]` 读取的内存**，也不能用 `DeleteObject` 释放。
+
+`BeginPaint` 同时完成两件事：
+
+1. 返回本次绘制使用的 `HDC`；
+2. 填写 `PAINTSTRUCT ps`，其中包括实际 `HDC`、是否应擦背景、需要更新的 `rcPaint` 矩形等信息。
+
+本例把返回值保存在 `RBX`，后面不断把它放回 `RCX`。绘制结束后必须把**同一个窗口句柄和同一个 `ps` 地址**交给 `EndPaint`。即使没有任何图形要画，也不能因为“没使用 HDC”就跳过 `EndPaint`。
+
+#### 3.1.1 客户区、窗口区与屏幕坐标不是一回事
+
+`TextOutW`、`FillRect` 使用的是 **HDC 当前映射下的坐标**；本章没有改变映射模式，因此可先把它们理解为客户区像素坐标：
+
+```text
+客户区左上角 (0, 0)
+    ┌──────────────────────────────► x 向右增大
+    │  (24,32)  x64 assembly + GDI
+    │  (24,64)  WM_PAINT -> ...
+    │  (24,88)  Direct2D ...
+    │  (24,120) client: W x H
+    │
+    │         ┌─────────────┐
+    │         │ (24,150)    │  本章矩形
+    │         │             │
+    │         └─────────────┘
+    ▼
+  y 向下增大
+```
+
+- **客户区**不包括标题栏、菜单和窗口边框；按钮、菜单等也不属于本章要画的区域。
+- 窗口左上角在屏幕上的位置与客户区内部坐标无关。移动整个窗口不会改变 `TextOutW(hdc, 24, 32, ...)` 的 `24,32`。
+- `TextOutW` 的 `x/y` 不是第几个字符，而是坐标。默认文字对齐方式下，它大致指定文字外接框的左上参考位置。
+- 这里的“像素”属于 GDI 默认映射。以后 Direct2D 使用 DIP（设备无关像素，第 17 章会解释），不能直接把两套单位混为一谈。
 
 ### 3.2 Windows x64 ABI 四件套
 
@@ -93,6 +125,33 @@ sub rsp, 56         RSP % 16 == 0   ← 8 - 56 = -48，-48 % 16 == 0
 
 两次 `push` 让栈移动了 16 字节，`56` 也是 8 的倍数但不是 16 的倍数——组合起来刚好让 `call` 点回到 0。这就是为什么不能照抄 `sub rsp, 48`。
 
+把 `RBP` 当作固定参照，可以看到每个区域并没有混在一起：
+
+```text
+高地址
+RBP+8   返回地址（由调用者的 call 压入）
+RBP+0   保存的旧 RBP
+RBP-8   保存的旧 RBX                    ← push rbx
+RBP-16  局部 HBRUSH，共 8 字节           ← [rbp-16]
+RBP-24  wsprintfW 返回的码元数，低 4 字节 ← [rbp-24]
+RBP-32  TextOutW 第 5 参数的 8 字节槽     ← call 前 [rsp+32]
+         ...
+RBP-64  32 字节影子空间的最低地址         ← call 前 [rsp+0]
+低地址
+```
+
+因此调用 `TextOutW` 前 `RSP=RBP-64`，它看到的前五个参数槽为：
+
+| 调用者视角 | 相对 RBP | 内容 |
+|---|---|---|
+| `[rsp+0..7]` | `RBP-64..-57` | 第 1 参数的影子槽 |
+| `[rsp+8..15]` | `RBP-56..-49` | 第 2 参数的影子槽 |
+| `[rsp+16..23]` | `RBP-48..-41` | 第 3 参数的影子槽 |
+| `[rsp+24..31]` | `RBP-40..-33` | 第 4 参数的影子槽 |
+| `[rsp+32..39]` | `RBP-32..-25` | 第 5 参数 `cchString` |
+
+`[rbp-24]` 和 `[rbp-16]` 位于 outgoing 参数区之外，所以后续 API 调用不会把它们当影子空间覆盖。
+
 **④ 非易失寄存器**
 
 本章把 `HDC` 放进 `RBX`：
@@ -122,7 +181,34 @@ typedef struct tagRECT {
 } RECT;
 ```
 
-4 个 `LONG`，共 16 字节，无填充。本章复用了 `PAINTSTRUCT`（72 字节）和 `RECT`（16 字节），定义都在 `common.asm`，偏移已由 `.lst` 验证。
+Windows 的 `LONG` 固定为 32 位有符号整数，即使在 x64 下也不是 8 字节。因此布局为：
+
+| 字段 | 偏移 | 大小 | 本章画矩形时写入的值 |
+|---|---:|---:|---:|
+| `left` | 0 | 4 | 24 |
+| `top` | 4 | 4 | 150 |
+| `right` | 8 | 4 | 324 |
+| `bottom` | 12 | 4 | 230 |
+| 合计 |  | **16** | 无额外填充 |
+
+若 `client_rect` 的地址为 `0x3000`，则 `right` 位于 `0x3008`，`bottom` 位于 `0x300C`。读取时也必须使用 32 位操作：
+
+```asm
+mov r8d, [rel client_rect + RECT.right]
+```
+
+`GetClientRect(hwnd, &rect)` 返回的是**客户区大小所对应的矩形**，正常情况下：
+
+```text
+left = 0
+top = 0
+right = 客户区宽度
+bottom = 客户区高度
+```
+
+因此本章直接把 `right/bottom` 格式化显示为宽高。不要把这条关系套到任意 `RECT` 上：普通矩形的宽高应分别计算为 `right-left`、`bottom-top`。`RECT` 的右边和下边通常采用“排他边界”约定；本章重点只是把它交给 `FillRect/FrameRect`，不要自行把 `right` 当成最后一个可见像素的坐标再加一。
+
+本章还复用了 `PAINTSTRUCT`（72 字节）和 `RECT`（16 字节），定义都在 `common.asm`，偏移可由 `.lst` 验证。
 
 ### 3.4 TextOutW 与字符串长度
 
@@ -141,21 +227,49 @@ banner_len    equ ($ - banner) / 2 - 1
 
 `.lst` 里这个值被直接编进机器码：`mov qword [rsp + 32], 0x12`（`0x12 = 18`），正好是 "x64 assembly + GDI" 的 18 个字符。
 
-### 3.5 GDI 对象的生命周期
+### 3.5 颜色、画刷与 GDI 对象生命周期
 
-GDI 对象（画笔、画刷、字体等）是内核对象，创建后必须释放，否则泄漏。本章的画刷生命周期：
+`FillRect` 和 `FrameRect` 的第三个参数是 `HBRUSH`，不是颜色整数。画刷决定用什么颜色或图案填充；`COLORREF` 只是创建画刷时传入的颜色描述。本章的关系是：
 
 ```text
-CreateSolidBrush(color)  ──► HBRUSH
-        │
-        ├─ FillRect(hdc, &rect, brush)    填充矩形
-        ├─ FrameRect(hdc, &rect, brush)   画矩形边框
-        │
-        ▼
-DeleteObject(brush)        释放画刷
+颜色值 0x00D0E8F0
+       │ CreateSolidBrush
+       ▼
+HBRUSH（本章拥有的新 GDI 对象）
+       │
+       ├─ FillRect(hdc, &rect, brush)    用画刷填充内部
+       ├─ FrameRect(hdc, &rect, brush)   用画刷绘制边框
+       │
+       ▼ DeleteObject
+释放画刷；此后该 HBRUSH 值不能再使用
 ```
 
-`COLORREF` 的布局是 `0x00BBGGRR`（注意字节顺序：蓝、绿、红），`0x00D0E8F0` 是浅蓝灰。
+`CreateSolidBrush` 可能返回 `NULL`，通用代码应先检查，再使用或释放。本章为突出主流程省略了失败分支，不能据此认为创建永远成功。
+
+GDI 对象由系统管理，不能 `HeapFree`、`CloseHandle`，也不要释放两次。另一方面，`DeleteObject` 只负责画刷，不负责 `BeginPaint` 返回的 `HDC`；后者由 `EndPaint` 配对处理。若画刷仍被选入某个 DC，通用代码还应先恢复原对象，再删除画刷。本例没有把画刷 `SelectObject` 进 DC，所以可在两次绘制后删除。
+
+#### 3.5.1 手算 COLORREF：它是 0x00BBGGRR
+
+`COLORREF` 的 32 位布局为：
+
+```text
+31              24 23              16 15               8 7                0
+┌─────────────────┬─────────────────┬─────────────────┬─────────────────┐
+│ 0x00（保留）     │ Blue 蓝色分量    │ Green 绿色分量   │ Red 红色分量     │
+└─────────────────┴─────────────────┴─────────────────┴─────────────────┘
+```
+
+所以 `0x00D0E8F0` 应拆为：
+
+| 分量 | 十六进制 | 十进制 |
+|---|---:|---:|
+| 红色 `RR` | `F0` | 240 |
+| 绿色 `GG` | `E8` | 232 |
+| 蓝色 `BB` | `D0` | 208 |
+
+它是红、绿分量较高的浅色，而不是凭十六进制外观猜出的“蓝色值 `0xD0`”。文字颜色 `0x00C06020` 则对应 `R=0x20、G=0x60、B=0xC0`。
+
+这也解释了为什么源码把颜色写进 `ECX/EDX`：`COLORREF` 只有 32 位，句柄 `HBRUSH` 才是 64 位。
 
 ### 3.6 InvalidateRect 触发重绘
 
@@ -171,11 +285,20 @@ InvalidateRect(hwnd, NULL, TRUE)   标记整个客户区为"脏"
 系统投递 WM_PAINT → 重新绘制
 ```
 
-`InvalidateRect` 只是"标记脏"，真正绘制发生在后续的 `WM_PAINT`。第三个参数 `TRUE` 表示重绘前先擦除背景。
+`InvalidateRect` 只是“把区域加入更新区”，不会在调用点立即同步执行本例的 `.on_paint`。消息循环之后取得并派发 `WM_PAINT` 时才真正绘制。第三个参数 `TRUE` 表示处理更新时让背景被擦除。
+
+这里需要区分两个动作：
+
+1. `InvalidateRect(..., TRUE)` 表达“希望背景擦除”；
+2. 窗口类背景画刷、`WM_ERASEBKGND` 和 `WM_PAINT` 决定“实际怎样擦、画什么”。
+
+本例窗口类设置了系统背景画刷，但 `WndProc` 收到 `WM_ERASEBKGND` 又直接返回 1，且 `.on_paint` 只在固定位置画文字和矩形，没有用客户区画刷完整覆盖旧内容。因此它是一个讲解消息分支的简化示例，**不是完整的无闪烁清屏模板**。通用做法要么让默认背景擦除发生，要么在 `WM_PAINT` 中先完整填充更新区域，再绘制内容；只有确实自己处理背景时，才应让 `WM_ERASEBKGND` 返回非零。
+
+如果窗口没有被遮挡、尺寸没有变化，也没有代码调用 `InvalidateRect`，系统不会仅因为“程序希望画面更新”就持续发送 `WM_PAINT`。这与第 24 章游戏循环需要主动计时、更新并重绘不同。
 
 ## 4. 实践用例
 
-本章 `gdi_paint.asm` 在窗口客户区画三行文字（标题、客户区尺寸、提示）和一个填充矩形带边框，拉伸窗口时文字实时更新。
+本章 `gdi_paint.asm` 在窗口客户区画三行静态提示文字、一行客户区尺寸文字，以及一个填充并描边的矩形。`WM_SIZE` 请求重绘后，尺寸文字会随窗口拉伸更新；矩形仍使用源码中写死的 `(24,150)-(324,230)`，不会自动居中。
 
 ### 4.1 构建命令
 
@@ -267,7 +390,7 @@ banner_len    equ ($ - banner) / 2 - 1
 
 回扣知识点 3.4：`$ - banner` 是字节数，`/2` 得码元数，`-1` 去结尾 0。`.lst` 里立即数 `0x12` 证明结果是 18。
 
-**③ TextOutW 的第 5 参数写 8 字节槽**
+**③ TextOutW 的第 5 参数写入完整栈槽**
 
 ```asm
     mov     rcx, rbx                ; hdc
@@ -278,7 +401,9 @@ banner_len    equ ($ - banner) / 2 - 1
     call    TextOutW
 ```
 
-回扣知识点 3.2①：第 5 参数走 `[rsp+32]`，必须用 `mov qword`。写成 `mov dword` 只写低 4 字节，高 4 字节是垃圾。
+回扣知识点 3.2①：第 5 参数从 `[rsp+32]` 开始，参数槽为 8 字节，所以源码用 `qword` 把整个槽写成确定值。这里要区分**槽宽**与**类型宽**：C 签名中的 `int cchString` 仍是 32 位，被调函数读取的是低 4 字节，并不会因为槽是 8 字节就把它变成 64 位长度。
+
+因此，把旧文档中的“`dword` 一定会读出巨大长度”当作 ABI 规则是不准确的；本章采用 `qword` 是清晰、确定且统一的栈槽写法。动态长度那一处先 `mov eax, [rbp-24]`，使 `RAX` 高 32 位自动清零，再 `mov qword [rsp+32], rax`，同样能写出完整槽。
 
 **④ GetClientRect + wsprintfW**
 
@@ -295,7 +420,20 @@ banner_len    equ ($ - banner) / 2 - 1
     call    wsprintfW
 ```
 
-回扣知识点 3.3：`client_rect.right/bottom` 就是客户区宽高（`left/top` 恒为 0）。`wsprintfW` 返回写入的字符数，后面当 `TextOutW` 的长度用。`[rbp-24]` 位于影子空间之上的安全区，不会被 `call` 踩掉。
+参数依次是：`RCX=目标缓冲区`、`RDX=格式串`、`R8D=right`、`R9D=bottom`。回扣知识点 3.3：对于 `GetClientRect` 的结果，`right/bottom` 就是客户区宽高。
+
+这里的 `xor eax,eax` 只是无害地清零 `RAX`，**不是 Windows x64 调用变参函数的必需步骤**。Windows x64 不使用 `AL` 记录 XMM 参数数量；那是 System V AMD64 的规则。本例两个 `%d` 对应的都是 32 位整数参数槽。
+
+`wsprintfW` 返回写入的 UTF-16 码元数（不含结尾 0），后面可作为 `TextOutW` 的显式长度；失败时返回负值，通用代码应先检查再使用。`info_buf` 为 128 字节，即只有 **64 个 UTF-16 码元**。当前固定短格式和两个十进制尺寸足够容纳，但 `wsprintfW` 本身没有容量参数，不能把它当作通用安全格式化函数。带容量的替代写法是：
+
+```c
+int n = _snwprintf(info_buf, 64, L"client: %d x %d", width, height);
+if (n < 0 || n >= 64) {
+    /* 失败或结果被截断，不能使用 n 作为有效长度 */
+}
+```
+
+容量单位同样是 UTF-16 码元，不是字节。
 
 **⑤ GDI 对象成对创建/释放**
 
@@ -308,7 +446,7 @@ banner_len    equ ($ - banner) / 2 - 1
     call    DeleteObject
 ```
 
-回扣知识点 3.5：`CreateSolidBrush` 返回 `HBRUSH`，必须 `DeleteObject`。每重绘一次泄漏一个 GDI 对象，任务管理器里 GDI 句柄数会一路上涨。
+回扣知识点 3.5：`CreateSolidBrush` 返回 `HBRUSH`，成功创建并使用后必须 `DeleteObject`。若每次都创建却遗漏释放，反复重绘就会不断积累 GDI 对象，任务管理器里的 GDI 句柄数可能持续上涨。
 
 **⑥ WM_SIZE 触发重绘**
 
@@ -321,16 +459,30 @@ banner_len    equ ($ - banner) / 2 - 1
     call    InvalidateRect
 ```
 
-回扣知识点 3.6：窗口尺寸变化后主动 `InvalidateRect`，保证拉伸时文字跟着重画。
+回扣知识点 3.6：窗口尺寸变化后主动 `InvalidateRect`，让系统在后续消息处理中请求重画。这里不是直接调用 `.on_paint`，也没有在 `WM_SIZE` 内使用旧的 `HDC`。
+
+**⑦ wmain 中还有一个容易漏掉的 ABI 瑕疵**
+
+```asm
+    lea     rdi, [rel wndclass]
+    xor     eax, eax
+    mov     ecx, WNDCLASSEXW_size / 4
+    rep     stosd
+```
+
+`rep stosd` 会递增修改 `RDI`，而 `RDI` 在 Windows x64 中属于非易失寄存器。本章 `wmain` 没有保存、恢复它，因此这段教学代码并不完全符合 ABI；它可能在当前 CRT 调用链中没有暴露问题，但不能作为通用函数模板。应像本章 `WndProc` 保存 `RBX` 一样保存 `RDI`，或改用不修改非易失寄存器的清零方式。源码保留原样，是为了让读者能对照识别这个真实问题。
 
 ## 6. 常见坑
 
 1. **`sub rsp, 48`**：在 `push rbx` 之后，48 是 16 的倍数，`call` 点会变成 `% 16 == 8`，调用 GDI 可能直接崩在 `movaps` 上。用 56。
-2. **`mov dword [rsp + 32], banner_len`**：只写低 4 字节，高 4 字节是垃圾，`TextOutW` 可能读到巨大的长度。
-3. **`banner_len` 忘了 `-1`**：会把结尾 0 也画进去（通常不可见，但长度语义错了）。
-4. **`CreateSolidBrush` 后不 `DeleteObject`**：每重绘一次泄漏一个 GDI 对象，任务管理器里 GDI 句柄数会一路上涨。
-5. **把局部槽放进影子空间**：本例影子空间是 `rbp-64 .. rbp-33`；若把 `[rbp-48]` 当局部槽，`call` 会覆盖它。本例的 `[rbp-16]` / `[rbp-24]` 都在安全区。
-6. **`make clean` 依赖 `rm`**：PowerShell 下用 `Remove-Item gdi_paint.exe,gdi_paint.obj,gdi_paint.obj.lst`。
+2. **把 8 字节参数槽误当成 64 位 `int`**：`cchString` 仍只有 32 位。本章写 `qword` 是为了完整、确定地填写栈槽，不能由此推出被调函数会读取一个 64 位长度。
+3. **把字节数直接传给 `TextOutW`**：`banner_len` 必须按 UTF-16 码元计数；忘了 `/2` 会把长度扩大两倍，忘了 `-1` 则多包含结尾 0。
+4. **把 `wsprintfW` 当安全格式化函数**：它没有容量参数，也不能用 `AL=0` 解决缓冲区问题。动态或不可信文本应使用带容量、能检查截断的接口。
+5. **`CreateSolidBrush` 后不 `DeleteObject`**：成功创建的画刷若每次重绘都不释放，会不断积累 GDI 对象。还要先检查创建是否成功，且不能对 `HDC` 调 `DeleteObject`。
+6. **把局部槽放进影子空间**：本例影子空间是 `rbp-64 .. rbp-33`；若把 `[rbp-48]` 当持久局部槽，后续 `call` 可以覆盖它。本例的 `[rbp-16]` / `[rbp-24]` 都在 outgoing 参数区之外。
+7. **认为 `WM_ERASEBKGND=1` 就已经擦好背景**：返回值只表示调用者声称已处理；本例并未完整覆盖更新区域，不能直接复制为防闪烁模板。
+8. **忽略 `wmain` 的 `RDI`**：`rep stosd` 修改了非易失 `RDI`，本章源码未保存它，是需要识别而不是照抄的 ABI 瑕疵。
+9. **`make clean` 依赖 `rm`**：PowerShell 下用 `Remove-Item gdi_paint.exe,gdi_paint.obj,gdi_paint.obj.lst`。
 
 ## 7. 练习
 

@@ -10,21 +10,22 @@
 
 - 用 `CreateSolidColorBrush` 创建三个画刷（填充、描边、圆）；
 - 用 `FillRectangle` / `DrawRectangle` / `FillEllipse` 画图元；
-- 掌握 **FLOAT 参数走 `XMM3`** 这条 x64 ABI 规则；
-- 写一个 `release_if_nonnull` 辅助函数；
-- 按"画刷 → 渲染目标 → 工厂"的顺序释放资源。
+- 掌握“第 4 个参数是 FLOAT 时走 `XMM3`，第 5 个参数走栈”这条 x64 ABI 规则；
+- 看懂 `release_if_nonnull` 辅助函数，并识别当前叶子函数版本的对齐瑕疵；
+- 按“画刷 → 渲染目标 → 工厂”的顺序释放资源；
+- 分清“当前示例在理想条件下可走通的流程”和“符合 ABI、可复用的正确写法”。
 
 跑通后你应该能回答：
 
-- `DrawRectangle(rect, brush, strokeWidth, strokeStyle)` 的 `strokeWidth` 为什么不在 `R9`？
-- 第 5 个参数 `strokeStyle` 又为什么在 `R9` 而不是 `[rsp+32]`？
+- `DrawRectangle(rect, brush, strokeWidth, strokeStyle)` 的 `strokeWidth` 为什么走 `XMM3` 而不是 `R9`？
+- 第 5 个参数 `strokeStyle` 为什么必须写在调用前的 `[rsp+32]`，即使 `R9` 没有存放有效参数？
 - `mov eax, 0x40000000` 为什么表示 `2.0f`？
 - 画刷为什么要先于渲染目标释放？
 
 ## 2. 前置 / 项目结构
 
 ```text
-masm-learn/
+nasm-learn/
 ├── common.asm                  D2D1_COLOR_F / RECT_F / ELLIPSE / BRUSH_PROPERTIES
 └── 18-d2d-brush-shapes/
     ├── Makefile
@@ -55,7 +56,7 @@ Direct2D 的图元绘制需要"渲染目标 + 画刷"配合：
 
 ### 3.2 Windows x64 ABI 四件套
 
-**① 前四个参数：RCX / RDX / R8 / R9（以及 XMM0～XMM3）**
+**① 参数按“位置”分配；第 5 个位置一定上栈**
 
 | 位置 | 整数/指针 | 浮点 |
 |---|---|---|
@@ -63,33 +64,42 @@ Direct2D 的图元绘制需要"渲染目标 + 画刷"配合：
 | 2 | `RDX` | `XMM1` |
 | 3 | `R8` | `XMM2` |
 | 4 | `R9` | `XMM3` |
-| 5+ | `[rsp+32]`…… | `[rsp+32]`…… |
+| 5 | 调用前 `[rsp+32]` | 调用前 `[rsp+32]` |
+| 6 | 调用前 `[rsp+40]` | 调用前 `[rsp+40]` |
 
-**关键：寄存器分配按"参数位置"走，不按"参数类型连续编号"。** 也就是说，第 4 个位置如果是浮点就用 `XMM3`，整数寄存器 `R9` 就空出来留给第 5 个位置的整数。
+前四个位置中，整数/指针与浮点数分别使用对应的整数寄存器或 XMM 寄存器。**但从第 5 个位置开始一律使用栈，不能把“空着的”整数寄存器继续分配给后面的参数。**
 
 `ID2D1RenderTarget::DrawRectangle(this, rect, brush, strokeWidth, strokeStyle)`：
 
-| 位置 | 参数 | 类型 | 去向 |
+| 位置 | 参数 | 类型 | 标准去向 |
 |---|---|---|---|
 | 1 | `this` | 指针 | `RCX` |
 | 2 | `rect` | 指针 | `RDX` |
 | 3 | `brush` | 指针 | `R8` |
 | 4 | `strokeWidth` | `FLOAT` | **`XMM3`** |
-| 5 | `strokeStyle` | 指针 | **`R9`** |
+| 5 | `strokeStyle` | 指针 | **调用前 `[rsp+32]`** |
 
-所以 `strokeStyle` 是第 5 个"位置"，但前 4 个位置里有一个被浮点占用，整数寄存器只用掉 3 个（`RCX/RDX/R8`），所以第 5 个整数仍能落到 `R9`——只有**位置 > 4** 才上栈。
+C++ 声明中的 `strokeStyle = NULL` 只是编译器的默认实参；机器码层面不存在“省略第 5 个参数”。调用者仍须提供一个 8 字节栈槽。被调函数入口后，返回地址又压入 8 字节，所以它在被调方视角位于 `[rsp+40]`。
 
-**② 32 字节影子空间**
+**② 32 字节影子空间与额外栈参**
 
-`WndProc` 用 `sub rsp, 32`。所有 D2D 调用都没有第 5 个栈参数，影子空间仍是必须的。
+每次 COM/API 调用前都必须预留 32 字节影子空间。`DrawRectangle` 还需要额外的第 5 参数槽，因此通用标准帧至少要 `32 + 8 = 40` 字节；`WndProc` 在 `push rbp` 后已经对齐，所以应把帧大小从 32 调整为 **48**（40 向上补到 16 的倍数），并在调用前写：
+
+```asm
+    mov     qword [rsp + 32], 0     ; 第 5 参 strokeStyle = NULL
+```
+
+当前源码只有 `sub rsp, 32`，且只执行 `xor r9d, r9d`，**没有提供第 5 参数栈槽**。此时 `[rsp+32]` 恰好是保存的旧 `RBP`，并不是 NULL。若某个运行环境看似能画，只能说明该 D2D 实现/路径没有按预期暴露问题，不能把它当作 ABI 正确或可移植的依据。
 
 **③ 16 字节对齐**
 
-`WndProc` 入口 8 → `push rbp` 0 → `sub rsp, 32` 仍 0。
+普通 `WndProc` 路径：入口 `RSP % 16 == 8` → `push rbp` 后为 0 → 帧大小必须是 16 的倍数。当前 `sub rsp, 32` 的对齐本身正确，但没有给第 5 参数留槽；标准改法是 `sub rsp, 48`。
 
 **④ 非易失寄存器**
 
-`release_if_nonnull` 只改 `RAX/RCX`（易失），不需要保存任何东西。但它作为叶子函数直接 `COM_CALL` 时，`call` 点 `RSP % 16 == 8`，严格来说违反了"call 点必须 0"的对齐规则。`Release` 的实现是系统代码，通常不依赖 16 字节对齐，所以实际能跑；但正确写法应该在函数入口 `sub rsp, 40`。到第 19 章的 `release_scene` 就改成了标准序言。本章这个版本可以当成"反例"。
+`RBX/RBP/RDI/RSI/R12～R15/XMM6～XMM15` 属于被调方保存寄存器。`release_if_nonnull` 只改易失的 `RAX/RCX`，但它没有序言：入口 `RSP % 16 == 8`，直接执行 `COM_CALL` 时 call 点仍是 8，违反对齐规则。当前示例能否运行取决于 `Release` 的实现是否容忍；通用写法应在入口 `sub rsp, 40`、返回前 `add rsp, 40`。第 19 章的 `release_scene` 展示了带标准序言的版本。
+
+当前 `wmain` 还用 `RDI` 配合 `rep stosd` 清零结构体，却没有保存调用者原有的 `RDI`。单次示例通常不会因此立刻出错，但作为由 CRT 调用的普通函数并不完整；可复用写法应保存/恢复 `RDI`，或改用易失寄存器加显式清零循环。
 
 ### 3.3 从 MinGW 头文件提取 D2D 图元结构
 
@@ -270,19 +280,33 @@ GUI 子系统，导入 `d2d1.dll`。**只编译不运行**。手动体验：`.\d
 
 回扣知识点 3.6：槽 17，偏移 `0x88`。`FillRectangle(rect, brush)` 只需前三个参数位置。
 
-**③ DrawRectangle 与 XMM3**
+**③ DrawRectangle：当前源码与标准写法**
+
+当前源码：
 
 ```asm
     mov     rcx, [rel p_rt]
-    lea     rdx, [rel rect_stroke]
+    lea     rdx, [rel rect_fill]
     mov     r8,  [rel p_stroke]
     mov     eax, 0x40000000         ; 2.0f 的位模式
     movd    xmm3, eax
-    xor     r9d, r9d                ; strokeStyle = NULL
+    xor     r9d, r9d                ; 只清 R9，不能代替第 5 个栈参数
     COM_CALL rcx, D2D1_RT_DRAW_RECTANGLE
 ```
 
-回扣知识点 3.2①/3.5：`strokeWidth` 是第 4 个位置的 `FLOAT`，走 `XMM3`；`strokeStyle` 是第 5 个位置的指针，因为 `R9` 还空着所以走 `R9`（不上栈）。`0x40000000` 是 `2.0f` 的 IEEE-754 位模式，`movd` 搬位模式不做整数转换。
+`strokeWidth` 是第 4 个位置的 `FLOAT`，所以走 `XMM3`；`0x40000000` 是 `2.0f` 的 IEEE-754 位模式，`movd` 只搬位、不做整数转换。当前源码的问题是第 5 个 `strokeStyle` 没有写入栈槽。把 `WndProc` 的帧扩为 48 字节后，标准调用应写成：
+
+```asm
+    mov     rcx, [rel p_rt]
+    lea     rdx, [rel rect_fill]
+    mov     r8,  [rel p_stroke]
+    mov     eax, 0x40000000
+    movd    xmm3, eax               ; 第 4 参
+    mov     qword [rsp + 32], 0     ; 第 5 参 strokeStyle = NULL
+    COM_CALL rcx, D2D1_RT_DRAW_RECTANGLE
+```
+
+这里不再给 `R9` 赋参数，因为第 5 个位置不属于寄存器参数区。
 
 **④ FillEllipse（槽 21）**
 
@@ -323,12 +347,15 @@ release_if_nonnull:
 
 ## 6. 常见坑
 
-1. **`strokeWidth` 写进 `R9`**：类型是 `FLOAT`，必须走 `XMM3`；写成 `R9` 会让 `strokeStyle` 也错位，`DrawRectangle` 可能画不出线或崩溃。
-2. **`movd xmm3, 2`**：`movd` 搬的是**位模式**，不是整数转换。`2` 的位模式是 `0x00000002`，解释成浮点几乎是 0（次正规数）。正确值是 `0x40000000`。
-3. **画刷创建后不检查返回值**：失败时 `p_fill = NULL`，`FillRectangle` 收到 NULL 画刷，D2D 会直接返回错误且画面空白。
-4. **先释放渲染目标再释放画刷**：画刷仍持有对渲染目标的引用，顺序反了虽然 `Release` 不会崩，但状态不干净。
-5. **`release_if_nonnull` 叶子版**：`call` 点 `RSP % 16 == 8`，属于不规范写法，第 19 章会修正。
-6. **`make clean` 依赖 `rm`**：PowerShell 下用 `Remove-Item d2d_shapes.exe,d2d_shapes.obj,d2d_shapes.obj.lst`。
+1. **`strokeWidth` 写进 `R9`**：第 4 个位置的类型是 `FLOAT`，必须走 `XMM3`；写错位置会导致线宽和后续参数都不符合被调方预期。
+2. **把 `strokeStyle` 放进 `R9`**：它仍是第 5 个位置，必须写调用前 `[rsp+32]`。当前源码在这里是教学反例，不能照抄为通用 ABI 模板。
+3. **只 `sub rsp, 32` 又写 `[rsp+32]`**：这会覆盖保存的旧 `RBP`。使用第 5 参数前必须扩大帧；本章 `WndProc` 可改为 `sub rsp, 48`。
+4. **`movd xmm3, 2`**：`movd` 搬的是**位模式**，不是整数转换。`2` 的位模式是 `0x00000002`，解释成浮点几乎是 0（次正规数）。整数 2 转浮点应使用 `cvtsi2ss`，常量 `2.0f` 的位模式才是 `0x40000000`。
+5. **画刷创建后不检查 HRESULT**：当前源码连续创建三个画刷后不检查返回值，并假定工厂、渲染目标和画刷都创建成功。通用写法应在每次调用后用 `test eax,eax; js 失败路径`，失败时按“已创建资源的逆序”清理。
+6. **先释放渲染目标再释放画刷**：资源依赖关系不清晰，容易在后续扩展成设备相关资源时出错。统一按“画刷 → 渲染目标 → 工厂”释放，并在释放后把全局指针清零。
+7. **`release_if_nonnull` 叶子版与未保存的 `RDI`**：前者 call 点未对齐，后者破坏调用者的非易失寄存器。当前示例依赖具体调用环境，通用库代码必须修正。
+8. **把 `EndDraw` 当 `void`**：当前源码没有检查设备丢失，也没有完整 `BeginPaint/EndPaint` 配对；它只演示最小 D2D 调用序列。第 19 章加入 `D2DERR_RECREATE_TARGET` 处理，但完整 Win32 绘图消息仍应按验证区域的生命周期处理。
+9. **`make clean` 依赖 `rm`**：PowerShell 下用 `Remove-Item d2d_shapes.exe,d2d_shapes.obj,d2d_shapes.obj.lst`。
 
 ## 7. 练习
 

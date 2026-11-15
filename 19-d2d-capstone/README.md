@@ -10,7 +10,7 @@
 
 - 把创建/释放资源封装成 `create_render_target` 与 `release_scene` 两个函数；
 - 在 `WM_SIZE` 里调用 `ID2D1HwndRenderTarget::Resize`（槽 58）；
-- 用 `SetTimer(hwnd, 1, 16, NULL)` + `WM_TIMER` 驱动 60 FPS 动画；
+- 用 `SetTimer(hwnd, 1, 16, NULL)` + `WM_TIMER` 驱动目标约 60 FPS 的动画，并理解它不是精确实时时钟；
 - 用 `cvtsi2ss` 把整数帧号转成浮点坐标；
 - 在 `EndDraw` 后检测 `D2DERR_RECREATE_TARGET`，设备丢失时释放场景、下一帧重建；
 - 在 `WM_DESTROY` 里 `KillTimer` + 完整释放。
@@ -25,7 +25,7 @@
 ## 2. 前置 / 项目结构
 
 ```text
-masm-learn/
+nasm-learn/
 ├── common.asm                   D2D 结构体、槽位、D2DERR_RECREATE_TARGET
 └── 19-d2d-capstone/
     ├── Makefile
@@ -49,8 +49,10 @@ wmain
   ├─ create_render_target       封装渲染目标+画刷创建
   └─ 消息循环
 
+wmain（创建窗口并取得工厂后）
+  └─ SetTimer(16ms)
+
 WndProc
-  ├─ WM_CREATE    SetTimer(16ms)
   ├─ WM_SIZE      更新 g_width/g_height → Resize
   ├─ WM_TIMER     g_tick++ → InvalidateRect
   ├─ WM_PAINT     create_render_target（若空）→ BeginDraw → 画 → EndDraw → 检测设备丢失
@@ -95,9 +97,30 @@ sub rsp, 64                 RSP % 16 == 0（64 是 16 的倍数）
 
 `release_scene` 与 `WndProc` 用 `sub rsp, 32`，同样成立。
 
-**④ 非易失寄存器**
+**④ 非易失寄存器：当前源码有两处瑕疵**
 
-三个函数都只用 `RAX/RCX/RDX/R8/R9`，不改 `RBX/RDI/RSI/R12~R15`，因此序言只有 `push rbp`。`create_render_target` 的返回值放在 `EAX`（`RAX` 的低 32 位），这是 Windows x64 的整数返回值约定。
+`RBX/RBP/RDI/RSI/R12～R15/XMM6～XMM15` 都是非易失寄存器。`release_scene` 只使用易失寄存器并保护 `RBP`，这一部分正确；但：
+
+- `create_render_target` 用 `RDI` 执行两次 `rep stosd`，没有保存它；
+- `wmain` 也用 `RDI` 清零 `wndclass`，同样没有保存。
+
+`create_render_target` 由 `WndProc` 调用时，还会间接改变窗口过程本应替系统保存的 `RDI`。当前示例能否运行取决于调用者是否恰好不依赖旧值，不能作为通用函数模板。正确写法可在 `push rbp` 后增加 `push rdi`，重新调整帧大小，并按相反顺序恢复；也可改用易失寄存器配合清零循环。`create_render_target` 的返回码放在 `EAX`，这是 Windows x64 的 32 位整数返回值约定。
+
+以 `create_render_target` 为例，若选择保存 `RDI`，一种可行布局是：
+
+```asm
+    push    rbp                     ; 入口 8 → 0
+    mov     rbp, rsp
+    push    rdi                     ; 0 → 8
+    sub     rsp, 72                 ; 8 → 0；72 覆盖原来的 64 字节工作区
+    ; ... 函数体 ...
+    add     rsp, 72
+    pop     rdi
+    pop     rbp
+    ret
+```
+
+这里不能照搬原来的 `leave`，因为 `leave` 会把 `RSP` 直接恢复到 `RBP`，跳过位于其后的 `pop rdi`；应按保存的逆序显式恢复。
 
 ### 3.3 D2D1_SIZE_U 与 Resize
 
@@ -122,7 +145,9 @@ typedef struct D2D1_SIZE_U {
 
 `58 * 8 = 464 = 0x1D0`，`.lst` 里的 `FF90D0010000` 就是它。
 
-`Resize` 失败通常意味着设备丢失（显卡驱动重置、远程桌面切换等），此时应丢掉场景，`WM_PAINT` 里重新创建。
+`Resize` 失败不一定都是设备丢失，也可能来自无效尺寸等参数问题。当前源码采用保守策略：**任何非 S_OK 都释放场景**，让下一次 `WM_PAINT` 尝试重建。这样实现简单，但若是持续性参数错误会反复创建失败；工程代码应记录 `HRESULT`，并只对适合重建的错误执行该策略。
+
+`WM_SIZE` 的参数映射为：`RCX=hwnd`、`EDX=WM_SIZE`、`R8=wParam`（尺寸状态）、`R9=lParam`。新宽度在 `lParam` 低 16 位，新高度在高 16 位。例如 `lParam=0x01E00280`，手算可得宽 `0x0280=640`、高 `0x01E0=480`。源码用 `movzx ecx,ax` 取低 16 位，再右移 16 位取高度。
 
 ### 3.4 create_render_target 的返回码
 
@@ -135,11 +160,13 @@ typedef struct D2D1_SIZE_U {
 | 2 | 画刷创建失败（已回滚） |
 | 3 | 渲染目标创建失败 |
 
-失败路径会先 `call release_scene` 回滚，避免半成品泄漏。像素尺寸来自 `g_width/g_height`，它们由 `WM_SIZE` 更新，所以窗口缩放后重建的渲染目标尺寸是正确的。
+任一个画刷创建失败都会进入 `.fail_brush`，通过 `call release_scene` 回滚已经创建的场景资源；`.fail_create` 直接返回 3，`.no_factory` 直接返回 1。通常 RT 创建失败时输出指针仍为空，因此当前流程可行；通用封装最好在所有失败入口统一清理，并先确保 `p_rt/p_box/p_dot` 初始为 0。像素尺寸来自 `g_width/g_height`，它们由 `WM_SIZE` 更新，所以窗口缩放后重建的渲染目标会使用最近记录的客户区尺寸。
 
 ### 3.5 定时器与动画
 
-`SetTimer(hwnd, 1, 16, NULL)` 设置一个 16ms（约 60 FPS）的定时器。`WM_TIMER` 只做两件事：帧号 +1、请求重画。
+`SetTimer(hwnd, 1, 16, NULL)` 请求以 16ms 为间隔投递 `WM_TIMER`，理论频率约 `1000/16=62.5` 次/秒，通常粗略称为 60 FPS。它是消息定时器，受系统计时器粒度、消息循环繁忙程度和 `WM_TIMER` 合并影响，**不保证每 16ms 到一次，也不保证稳定 60 FPS**。本章每次收到消息只把帧号加 1，所以实际动画速度会随消息到达速度变化；高精度循环应测量真实经过时间。
+
+`WM_TIMER` 只做两件事：帧号 +1、调用 `InvalidateRect` 请求重画。更新与绘制分离后，`WM_PAINT` 负责真正渲染。
 
 动画坐标由帧号 `g_tick` 计算：
 
@@ -193,6 +220,18 @@ PostQuitMessage(0)          退出消息循环
 ```
 
 `release_scene` 不释放工厂，因为工厂生命周期比场景长，只有在 `WM_DESTROY` 才释放。
+
+### 3.9 当前源码的运行条件与通用写法边界
+
+本章源码演示的是“消息驱动的最小 D2D 动画骨架”，并依赖以下条件：
+
+- 工厂、窗口和首轮资源创建成功；启动失败分支只返回错误码，没有逐层回滚；
+- `WM_PAINT` 主要由 `InvalidateRect` 触发，当前没有 `BeginPaint/EndPaint` 配对。完整 Win32 写法应验证更新区域，并避免把 D2D 的 `BeginDraw/EndDraw` 误当成它们的替代品；
+- `EndDraw` 只特殊处理 `D2DERR_RECREATE_TARGET`，其他失败 `HRESULT` 没有记录；
+- `create_render_target` 与 `wmain` 未保存 `RDI`，属于当前源码的 ABI 瑕疵；
+- `SetTimer` 只提供近似心跳，不提供基于真实时间的恒速运动。
+
+因此，本章可以用来逐行理解“创建—更新—绘制—丢失—重建—释放”的状态流，但不能原样当作生产级窗口模板。通用版本至少应补齐参数检查、失败清理、非易失寄存器保存、绘图消息生命周期和错误日志。
 
 ## 4. 实践用例
 
@@ -313,7 +352,7 @@ create_render_target:
     call    SetTimer
 ```
 
-回扣知识点 3.5：`SetTimer(hwnd, 1, 16, NULL)`，16ms ≈ 60 FPS。id 用 1，不用 0（系统保留）。
+回扣知识点 3.5：`SetTimer(hwnd, 1, 16, NULL)` 请求约 16ms 一次的消息心跳，但不保证精确实时。这里的 `1` 是本程序自选、与 `KillTimer` 和 `WM_TIMER` 判断保持一致的计时器 ID，便于管理，不是因为“0 被系统保留”。
 
 **④ cvtsi2ss 整数转浮点**
 
@@ -358,11 +397,13 @@ create_render_target:
 1. **`WM_PAINT` 里不判空 `p_rt`**：`EndDraw` 失败后 `p_rt` 已被清 0，下一帧必须先 `create_render_target`。
 2. **`EndDraw` 返回值只判 `S_OK`**：`D2DERR_RECREATE_TARGET` 是"可恢复"的，必须单独处理。
 3. **`Resize` 后忘记 `InvalidateRect`**：窗口拉伸后画面停留在旧尺寸，直到下一次定时器触发。
-4. **`SetTimer` 用 0 作为 id**：0 由系统保留，行为未定义；用 1。
-5. **`WM_DESTROY` 里先释放工厂再 `KillTimer`**：定时器回调可能还会用到场景，顺序应为"停定时器 → 释放场景 → 释放工厂"。
-6. **`cvtsi2ss xmm0, eax` 写成 `movd`**：得到的是整数位模式，坐标会变成 0 或极大的值。
-7. **`CreateWindowExW` 的栈参数只写 4 字节**：高 4 字节残留，尺寸可能异常。
-8. **`make clean` 依赖 `rm`**：PowerShell 下用 `Remove-Item d2d_capstone.exe,d2d_capstone.obj,d2d_capstone.obj.lst`。
+4. **把 16ms 当作精确的 60 FPS**：`WM_TIMER` 会受消息循环与系统粒度影响；本章动画按“消息次数”推进，不是按真实秒数推进。
+5. **资源释放后继续使用旧指针**：`release_scene` 已把场景指针清零；重建必须等下一次 `WM_PAINT`，不要缓存旧的 `p_rt/p_box/p_dot`。
+6. **`create_render_target` 与 `wmain` 未保存 `RDI`**：当前示例可能正常运行，但违反非易失寄存器约定；通用写法必须保存/恢复，或改用易失寄存器。
+7. **`cvtsi2ss xmm0, eax` 写成 `movd`**：前者做整数数值转换，后者只复制位模式，结果完全不同。
+8. **`CreateWindowExW` 的栈参数只写 4 字节**：每个栈参数槽为 8 字节，应写完整 `qword`，避免高位残留。
+9. **启动失败路径没有逆序清理**：当前 `.fail_d2d` 直接返回 3，依赖进程退出回收；通用程序应释放已经创建的场景、工厂和窗口。
+10. **`make clean` 依赖 `rm`**：PowerShell 下用 `Remove-Item d2d_capstone.exe,d2d_capstone.obj,d2d_capstone.obj.lst`。
 
 ## 7. 练习
 
@@ -376,7 +417,7 @@ create_render_target:
 
 第 20 章开始脱离 CRT：
 
-- 自己写入口 `_start`，不再依赖 `wmainCRTStartup`；
-- 手动从 PEB 取 `ImageBase` / `ProcessParameters`，或改用 `GetModuleHandleW`；
+- 自己写入口 `_start`，用 `gcc -nostartfiles` 去掉 CRT 启动文件；
+- 用 `GetCommandLineW` 获取原始命令行，并用 `WriteConsoleW` 输出；
 - 用 `ExitProcess` 保证进程可控退出；
-- 为最终"纯汇编 Direct2D 游戏"做准备。
+- 认识控制台输出与重定向的差别，为最终“纯汇编 Direct2D 游戏”做准备。
